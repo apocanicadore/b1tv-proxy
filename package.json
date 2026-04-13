@@ -1,0 +1,15 @@
+{
+  "name": "b1tv-hls-proxy",
+  "version": "1.0.0",
+  "description": "Headless proxy to extract signed B1TV HLS URL from b1tv.ro/live",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "puppeteer": "^22.15.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
