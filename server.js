@@ -360,9 +360,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /hls — HLS relay: fetch M3U8 from CDN and rewrite segment URLs ────
-  if (req.method === 'GET' && url === '/hls') {
-    console.log('\n[proxy] ← GET /hls');
+  // ── GET /live.m3u8 or /hls — HLS relay ───────────────────────────────────
+  // /live.m3u8 is the canonical route (iOS auto-detects HLS from .m3u8 extension)
+  // /hls kept for backward compatibility
+  // HEAD requests handled explicitly so iOS gets correct Content-Type before GET
+  const isHlsRoute = (url === '/live.m3u8' || url === '/hls') &&
+    (req.method === 'GET' || req.method === 'HEAD');
+
+  if (isHlsRoute) {
+    console.log(`\n[proxy] ← ${req.method} ${url}`);
     try {
       const result = await getHlsUrl();
       if (!result || !result.url) {
@@ -397,16 +403,20 @@ const server = http.createServer(async (req, res) => {
       const proxyBase = `${proto}://${host}`;
 
       const rewritten = rewriteM3u8(m3u8, result.url, proxyBase);
-      console.log(`[proxy] /hls → 200 (${m3u8.split('\n').length} lines, proxy: ${proxyBase})`);
+      console.log(`[proxy] ${url} → 200 (${m3u8.split('\n').length} lines, proxy: ${proxyBase})`);
 
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Access-Control-Allow-Origin', '*');
       res.writeHead(200);
+      // HEAD: don't send body (but headers are set correctly for iOS pre-flight)
+      if (req.method === 'HEAD') { res.end(); return; }
       res.end(rewritten);
     } catch (e) {
-      console.error('[proxy] /hls error:', e.message);
+      console.error(`[proxy] ${url} error:`, e.message);
       res.writeHead(500);
-      res.end(JSON.stringify({ error: e.message }));
+      if (req.method !== 'HEAD') res.end(JSON.stringify({ error: e.message }));
+      else res.end();
     }
     return;
   }
