@@ -653,8 +653,21 @@ const server = http.createServer(async (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     const claims = getAuthUser(req);
     if (!claims) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
-    const user = _users.get(claims.sub);
-    if (!user) { res.writeHead(404); res.end(JSON.stringify({ error: 'User not found' })); return; }
+    let user = _users.get(claims.sub);
+    if (!user) {
+      // Railway restarted — in-memory _users is empty but JWT is still valid.
+      // Re-create a minimal user object from the JWT claims so the app session
+      // survives server restarts without forcing a new login.
+      const provider = claims.sub.startsWith('apple:') ? 'apple' : 'google';
+      user = upsertUser({
+        id: claims.sub,
+        email: claims.email ?? '',
+        displayName: claims.email?.split('@')[0] ?? 'Utilizator',
+        avatarUrl: null,
+        provider,
+      });
+      console.log(`[auth] /auth/me — user recreated from JWT after restart: ${claims.sub}`);
+    }
     res.writeHead(200);
     res.end(JSON.stringify(user));
     return;
