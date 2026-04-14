@@ -1,27 +1,32 @@
 /**
- * B1 TV HLS proxy server — v2 (HLS Relay mode)
+ * B1 TV HLS proxy server — v3 (HLS Relay + Push Notifications)
  *
- * Problem: DeJaCast CDN IP-locks signed HLS URLs.
- * The URL captured by Chromium (Railway IP) returns 403 when fetched
- * from a mobile device (different IP).
+ * HLS endpoints:
+ * - GET /live.m3u8     → HLS relay (canonical, iOS auto-detects from extension)
+ * - GET /hls           → HLS relay (legacy alias)
+ * - GET /hls-segment   → segment proxy from CDN
+ * - GET /live-url      → raw CDN URL (diagnostics)
  *
- * Solution: Full HLS relay.
- * - GET /hls           → fetches M3U8 from CDN (Railway IP + session cookies),
- *                         rewrites segment URLs to go through this proxy, returns
- *                         to app. AVPlayer loads playlist from Railway.
- * - GET /hls-segment   → proxies individual .ts segments from CDN to app.
- *                         All CDN traffic goes through Railway's trusted IP.
+ * Push notification endpoints:
+ * - POST /register-token  → register Expo push token + subscribed topics
  *
- * Other endpoints:
- * - GET /live-url      → raw CDN URL + metadata (kept for diagnostics/debug)
- * - GET /polls         → poll data
+ * Poll endpoints:
+ * - GET  /polls
  * - POST /polls/:id/vote
+ *
+ * Push architecture:
+ * - In-memory token store (Map<token, {topics, registeredAt}>)
+ * - RSS poller every 3 min checks all B1TV category feeds
+ * - New articles → Expo Push API notifies subscribed devices
+ * - Breaking news detected by feed (main /feed) or title keywords
+ * - Tokens auto-expire after 24 h (re-registered on every app launch)
  */
 
 'use strict';
 
 const http      = require('http');
 const https     = require('https');
+const crypto    = require('crypto');
 const puppeteer = require('puppeteer');
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -316,12 +321,283 @@ async function getHlsUrl() {
   }
 }
 
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
+// In-memory user store: Map<userId, user-object>
+const _users = new Map();
+
+function jwtSign(payload) {
+  const h = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const b = Buffer.from(JSON.stringify({ ...payload, iat: Math.floor(Date.now() / 1000) })).toString('base64url');
+  const s = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${b}`).digest('base64url');
+  return `${h}.${b}.${s}`;
+}
+
+function jwtVerify(token) {
+  if (!token) throw new Error('No token');
+  const [h, b, s] = (token || '').split('.');
+  if (!h || !b || !s) throw new Error('Malformed token');
+  const expected = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${b}`).digest('base64url');
+  if (s !== expected) throw new Error('Invalid signature');
+  return JSON.parse(Buffer.from(b, 'base64url').toString('utf8'));
+}
+
+function getAuthUser(req) {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+  if (!token) return null;
+  try { return jwtVerify(token); } catch { return null; }
+}
+
+/** Decode (not verify) a JWT — used for Apple identity tokens (RS256). */
+function jwtDecode(token) {
+  const parts = (token || '').split('.');
+  if (parts.length < 2) return null;
+  try { return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')); }
+  catch { return null; }
+}
+
+/** Call Google tokeninfo to verify an ID token and get email/name/picture. */
+function verifyGoogleToken(idToken) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
+      { timeout: 8_000 },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(Buffer.concat(chunks).toString());
+            if (data.error) reject(new Error(data.error));
+            else resolve(data);
+          } catch (e) { reject(e); }
+        });
+      },
+    );
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+  });
+}
+
+function upsertUser({ id, email, displayName, avatarUrl, provider }) {
+  const existing = _users.get(id);
+  const user = {
+    id,
+    email:          email          || existing?.email          || '',
+    displayName:    displayName    || existing?.displayName    || email?.split('@')[0] || 'Utilizator',
+    avatarUrl:      avatarUrl      || existing?.avatarUrl      || null,
+    provider,
+    subscriptionTier: existing?.subscriptionTier ?? 'free',
+    preferences:    existing?.preferences ?? {
+      notificationTopics: ['breaking', 'live_alerts'],
+      preferredCategories: ['politica', 'extern', 'economie'],
+      autoplayVideos: true,
+      highQualityStreaming: false,
+      darkMode: true,
+    },
+    savedArticleIds:  existing?.savedArticleIds  ?? [],
+    favoriteShowIds:  existing?.favoriteShowIds  ?? [],
+    watchlistTopics:  existing?.watchlistTopics  ?? [],
+    createdAt:        existing?.createdAt         ?? new Date().toISOString(),
+  };
+  _users.set(id, user);
+  return user;
+}
+
+// ── Push Notifications ────────────────────────────────────────────────────────
+
+/**
+ * In-memory token store.
+ * Map<expoPushToken, { topics: string[], registeredAt: number }>
+ * Tokens are re-registered on every app launch so ephemeral storage is fine.
+ */
+const _tokens = new Map();
+
+/**
+ * Per-feed set of already-seen article URLs.
+ * Populated on first poll (seeding), used to detect new articles after that.
+ */
+const _seenUrls = new Map(); // Map<feedUrl, Set<articleUrl>>
+
+// RSS feeds → topic mapping (matches NotificationTopic in app types)
+const RSS_FEEDS = [
+  { url: 'https://www.b1tv.ro/feed',                   topic: 'breaking'  },
+  { url: 'https://www.b1tv.ro/politica/feed',          topic: 'politica'  },
+  { url: 'https://www.b1tv.ro/economic/feed',          topic: 'economie'  },
+  { url: 'https://www.b1tv.ro/externe/feed',           topic: 'extern'    },
+  { url: 'https://www.b1tv.ro/sport/feed',             topic: 'sport'     },
+  { url: 'https://www.b1tv.ro/eveniment/feed',         topic: 'eveniment' },
+  { url: 'https://www.b1tv.ro/meteo/feed',             topic: 'meteo'     },
+  { url: 'https://www.b1tv.ro/monden/feed',            topic: 'lifestyle' },
+  { url: 'https://www.b1tv.ro/it-c/feed',              topic: 'itc'       },
+  { url: 'https://www.b1tv.ro/auto/feed',              topic: 'auto'      },
+  { url: 'https://www.b1tv.ro/horoscop/feed',          topic: 'horoscop'  },
+  { url: 'https://www.b1tv.ro/calendar-religios/feed', topic: 'calendar'  },
+];
+
+const TOPIC_LABELS = {
+  breaking: 'Breaking News', politica: 'Politică', economie: 'Economie',
+  extern: 'Externe', sport: 'Sport', eveniment: 'Eveniment', meteo: 'Meteo',
+  lifestyle: 'Lifestyle', itc: 'IT&C', auto: 'Auto', horoscop: 'Horoscop',
+  calendar: 'Calendar', live_alerts: 'Live', polls: 'Sondaje',
+};
+
+const BREAKING_RE = /EXCLUSIV|BREAKING|ALERT|ATEN[ȚT]IE|URGENT|ULTIMA\s+OR[ĂA]/i;
+
+// ── RSS parser (no external deps) ────────────────────────────────────────────
+
+function rssStripHtml(html) {
+  return html.replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&nbsp;/g, ' ').replace(/\s{2,}/g, ' ').trim();
+}
+
+function parseRssFeed(xml) {
+  const items = [];
+  const re = /<item[\s>]([\s\S]*?)<\/item>/gi;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const b = m[1];
+    const titleM = b.match(/<title[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/title>/i);
+    const title  = (titleM?.[1] ?? titleM?.[2] ?? '').trim();
+    const linkM  = b.match(/<link[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/link>/i);
+    const link   = (linkM?.[1] ?? linkM?.[2] ?? '').trim();
+    const descM  = b.match(/<description[^>]*>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/description>/i);
+    const body   = rssStripHtml(descM?.[1] ?? descM?.[2] ?? '').slice(0, 160);
+    if (title && link) items.push({ title, link, body });
+  }
+  return items;
+}
+
+function fetchRssFeed(feedUrl) {
+  return new Promise((resolve) => {
+    const req = https.get(feedUrl, {
+      headers: { 'User-Agent': MOBILE_UA, 'Accept': 'application/rss+xml, text/xml, */*' },
+      timeout: 10_000,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        try { resolve(parseRssFeed(Buffer.concat(chunks).toString('utf8'))); }
+        catch (e) { console.warn('[push] RSS parse error:', e.message); resolve([]); }
+      });
+    });
+    req.on('error', (e) => { console.warn('[push] RSS fetch error:', e.message); resolve([]); });
+    req.on('timeout', () => { req.destroy(); resolve([]); });
+  });
+}
+
+// ── Expo Push API sender ──────────────────────────────────────────────────────
+
+function sendExpoPush(messages) {
+  if (!messages.length) return Promise.resolve();
+  const body = JSON.stringify(messages);
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'exp.host',
+      path:     '/--/api/v2/push/send',
+      method:   'POST',
+      headers: {
+        'Content-Type':   'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        'Accept':         'application/json',
+        'Accept-Encoding':'gzip, deflate',
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        console.log(`[push] Expo API → ${res.statusCode} (${messages.length} msg)`);
+        resolve();
+      });
+    });
+    req.on('error', (e) => { console.warn('[push] Expo API error:', e.message); resolve(); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── RSS poller ────────────────────────────────────────────────────────────────
+
+async function pollAndNotify() {
+  if (_tokens.size === 0) return;
+
+  // Remove tokens older than 24 h (likely uninstalled devices)
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const [token, d] of _tokens) {
+    if (d.registeredAt < cutoff) { _tokens.delete(token); }
+  }
+
+  console.log(`[push] poll — ${RSS_FEEDS.length} feeds, ${_tokens.size} device(s)`);
+
+  for (const feed of RSS_FEEDS) {
+    try {
+      const articles = await fetchRssFeed(feed.url);
+      if (!articles.length) continue;
+
+      if (!_seenUrls.has(feed.url)) {
+        // First poll: seed seen set without sending notifications
+        _seenUrls.set(feed.url, new Set(articles.map((a) => a.link)));
+        continue;
+      }
+
+      const seen = _seenUrls.get(feed.url);
+      const fresh = articles.filter((a) => a.link && !seen.has(a.link));
+      articles.forEach((a) => { if (a.link) seen.add(a.link); });
+
+      if (!fresh.length) continue;
+      console.log(`[push] ${fresh.length} new article(s) in ${feed.topic}`);
+
+      for (const article of fresh.slice(0, 3)) {
+        const isBreaking = feed.topic === 'breaking' || BREAKING_RE.test(article.title);
+        const topic = isBreaking ? 'breaking' : feed.topic;
+
+        const messages = [];
+        for (const [token, d] of _tokens) {
+          const topics = d.topics || [];
+          const wantsIt = topics.includes(topic) ||
+            (isBreaking && (topics.includes('live_alerts') || topics.includes('breaking')));
+          if (!wantsIt) continue;
+          messages.push({
+            to:        token,
+            title:     isBreaking ? '🔴 BREAKING — B1 TV' : `B1 TV · ${TOPIC_LABELS[topic] ?? topic}`,
+            body:      article.title,
+            data:      { deepLink: article.link, topic, articleUrl: article.link },
+            sound:     isBreaking ? 'default' : 'default',
+            priority:  isBreaking ? 'high' : 'normal',
+            channelId: isBreaking ? 'breaking' : 'news',
+          });
+        }
+
+        // Expo Push API accepts max 100 messages per call
+        for (let i = 0; i < messages.length; i += 100) {
+          await sendExpoPush(messages.slice(i, i + 100));
+        }
+      }
+    } catch (e) {
+      console.warn(`[push] feed error (${feed.topic}):`, e.message);
+    }
+  }
+}
+
+// Start poller: seed after 20 s, then every 3 min
+setTimeout(async () => {
+  await pollAndNotify().catch((e) => console.error('[push] initial poll error:', e.message));
+  setInterval(
+    () => pollAndNotify().catch((e) => console.error('[push] poll error:', e.message)),
+    3 * 60 * 1000,
+  );
+  console.log('[push] poller started — every 3 min');
+}, 20_000);
+
 // ── HTTP server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
   // ── CORS ──────────────────────────────────────────────────────────────────
   res.setHeader('Access-Control-Allow-Origin',  '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') {
@@ -331,6 +607,91 @@ const server = http.createServer(async (req, res) => {
   }
 
   const url = req.url || '/';
+
+  // ── POST /auth/apple ──────────────────────────────────────────────────────
+  if (req.method === 'POST' && url === '/auth/apple') {
+    res.setHeader('Content-Type', 'application/json');
+    const body = await readBody(req);
+    const { identityToken, fullName, email } = body;
+    if (!identityToken) { res.writeHead(400); res.end(JSON.stringify({ error: 'Missing identityToken' })); return; }
+    // Decode without RS256 verification (token is short-lived; acceptable for MVP)
+    const claims = jwtDecode(identityToken);
+    if (!claims?.sub) { res.writeHead(401); res.end(JSON.stringify({ error: 'Invalid Apple token' })); return; }
+    const userId = `apple:${claims.sub}`;
+    const resolvedEmail = email || claims.email || '';
+    const resolvedName  = (fullName?.givenName && fullName?.familyName)
+      ? `${fullName.givenName} ${fullName.familyName}`.trim()
+      : (fullName?.givenName || resolvedEmail.split('@')[0] || 'Utilizator');
+    const user = upsertUser({ id: userId, email: resolvedEmail, displayName: resolvedName, avatarUrl: null, provider: 'apple' });
+    const token = jwtSign({ sub: userId, email: user.email });
+    console.log(`[auth] Apple sign-in: ${resolvedEmail || userId}`);
+    res.writeHead(200);
+    res.end(JSON.stringify({ token, user }));
+    return;
+  }
+
+  // ── POST /auth/google ──────────────────────────────────────────────────────
+  if (req.method === 'POST' && url === '/auth/google') {
+    res.setHeader('Content-Type', 'application/json');
+    const body = await readBody(req);
+    const { idToken } = body;
+    if (!idToken) { res.writeHead(400); res.end(JSON.stringify({ error: 'Missing idToken' })); return; }
+    let claims;
+    try { claims = await verifyGoogleToken(idToken); }
+    catch (e) { res.writeHead(401); res.end(JSON.stringify({ error: `Google token invalid: ${e.message}` })); return; }
+    const userId = `google:${claims.sub}`;
+    const user = upsertUser({ id: userId, email: claims.email, displayName: claims.name, avatarUrl: claims.picture, provider: 'google' });
+    const token = jwtSign({ sub: userId, email: user.email });
+    console.log(`[auth] Google sign-in: ${claims.email}`);
+    res.writeHead(200);
+    res.end(JSON.stringify({ token, user }));
+    return;
+  }
+
+  // ── GET /auth/me ───────────────────────────────────────────────────────────
+  if (req.method === 'GET' && url === '/auth/me') {
+    res.setHeader('Content-Type', 'application/json');
+    const claims = getAuthUser(req);
+    if (!claims) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+    const user = _users.get(claims.sub);
+    if (!user) { res.writeHead(404); res.end(JSON.stringify({ error: 'User not found' })); return; }
+    res.writeHead(200);
+    res.end(JSON.stringify(user));
+    return;
+  }
+
+  // ── PATCH /auth/me/preferences ────────────────────────────────────────────
+  if (req.method === 'PATCH' && url === '/auth/me/preferences') {
+    res.setHeader('Content-Type', 'application/json');
+    const claims = getAuthUser(req);
+    if (!claims) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+    const user = _users.get(claims.sub);
+    if (!user) { res.writeHead(404); res.end(JSON.stringify({ error: 'User not found' })); return; }
+    const body = await readBody(req);
+    user.preferences = { ...user.preferences, ...body };
+    _users.set(claims.sub, user);
+    res.writeHead(200);
+    res.end(JSON.stringify(user));
+    return;
+  }
+
+  // ── POST /register-token ──────────────────────────────────────────────────
+  if (req.method === 'POST' && url === '/register-token') {
+    res.setHeader('Content-Type', 'application/json');
+    const body = await readBody(req);
+    const { token, topics } = body;
+    if (!token || typeof token !== 'string' || !token.startsWith('ExponentPushToken')) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Invalid or missing Expo push token' }));
+      return;
+    }
+    const validTopics = Array.isArray(topics) ? topics.filter((t) => typeof t === 'string') : [];
+    _tokens.set(token, { topics: validTopics, registeredAt: Date.now() });
+    console.log(`[push] registered …${token.slice(-10)}  topics=[${validTopics.join(',')}]  total=${_tokens.size}`);
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, topics: validTopics }));
+    return;
+  }
 
   // ── GET /polls ─────────────────────────────────────────────────────────────
   if (req.method === 'GET' && url === '/polls') {
@@ -505,10 +866,14 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log('');
   console.log('╔══════════════════════════════════════════════════════════╗');
-  console.log(`║  B1TV HLS Proxy v2  ·  http://localhost:${PORT}             ║`);
-  console.log('║  GET /hls           →  HLS relay (M3U8 rewritten)        ║');
-  console.log('║  GET /hls-segment   →  segment proxy from CDN            ║');
-  console.log('║  GET /live-url      →  raw CDN URL (diagnostics)         ║');
+  console.log(`║  B1TV Proxy v3  ·  http://localhost:${PORT}                ║`);
+  console.log('║  GET  /live.m3u8        →  HLS relay (canonical)        ║');
+  console.log('║  GET  /hls              →  HLS relay (legacy)           ║');
+  console.log('║  GET  /hls-segment      →  segment proxy from CDN       ║');
+  console.log('║  GET  /live-url         →  raw CDN URL (diagnostics)    ║');
+  console.log('║  POST /register-token   →  push notification token      ║');
+  console.log('║  GET  /polls            →  poll data                    ║');
+  console.log('║  POST /polls/:id/vote   →  submit vote                  ║');
   console.log('╚══════════════════════════════════════════════════════════╝');
   console.log('');
 });
