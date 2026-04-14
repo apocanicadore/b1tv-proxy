@@ -243,7 +243,7 @@ async function resolveFromPage() {
         ];
         for (const sel of selectors) {
           const el = document.querySelector(sel);
-          if (el) { (el as HTMLElement).click(); return sel; }
+          if (el) { el.click(); return sel; }
         }
         return null;
       });
