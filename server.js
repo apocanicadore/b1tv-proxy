@@ -28,6 +28,7 @@ const http      = require('http');
 const https     = require('https');
 const crypto    = require('crypto');
 const puppeteer = require('puppeteer');
+const { Pool }  = require('pg');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const PORT        = process.env.PORT || 3031;
@@ -321,6 +322,86 @@ async function getHlsUrl() {
   }
 }
 
+// ── PostgreSQL ────────────────────────────────────────────────────────────────
+
+const _pool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  : null;
+
+async function dbQuery(sql, params = []) {
+  if (!_pool) return null;
+  const client = await _pool.connect();
+  try { return await client.query(sql, params); }
+  finally { client.release(); }
+}
+
+async function initSchema() {
+  if (!_pool) { console.log('[db] No DATABASE_URL — email/password auth unavailable'); return; }
+  await dbQuery(`
+    CREATE TABLE IF NOT EXISTS users (
+      id           TEXT PRIMARY KEY,
+      email        TEXT UNIQUE,
+      password_hash TEXT,
+      display_name TEXT,
+      avatar_url   TEXT,
+      provider     TEXT    DEFAULT 'email',
+      subscription_tier TEXT DEFAULT 'free',
+      preferences  JSONB   DEFAULT '{}',
+      saved_article_ids  TEXT[] DEFAULT ARRAY[]::TEXT[],
+      favorite_show_ids  TEXT[] DEFAULT ARRAY[]::TEXT[],
+      watchlist_topics   TEXT[] DEFAULT ARRAY[]::TEXT[],
+      created_at   TIMESTAMPTZ DEFAULT NOW(),
+      updated_at   TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id    TEXT REFERENCES users(id) ON DELETE CASCADE,
+      token      TEXT UNIQUE NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used       BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  console.log('[db] Schema ready');
+}
+
+initSchema().catch((e) => console.error('[db] Schema init error:', e.message));
+
+// ── Password helpers ──────────────────────────────────────────────────────────
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, 100_000, 64, 'sha512').toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, hash] = stored.split(':');
+  if (!salt || !hash) return false;
+  const attempt = crypto.pbkdf2Sync(password, salt, 100_000, 64, 'sha512').toString('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(hash, 'hex'), Buffer.from(attempt, 'hex'));
+  } catch { return false; }
+}
+
+// ── Email (Resend) ────────────────────────────────────────────────────────────
+
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const FROM_EMAIL     = process.env.FROM_EMAIL || 'onboarding@resend.dev';
+
+async function sendEmail({ to, subject, html }) {
+  if (!RESEND_API_KEY) { console.warn('[email] No RESEND_API_KEY set'); return; }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method:  'POST',
+      headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ from: FROM_EMAIL, to: [to], subject, html }),
+    });
+    if (!res.ok) console.warn('[email] Send failed:', await res.text());
+    else console.log('[email] Sent to', to);
+  } catch (e) { console.warn('[email] Error:', e.message); }
+}
+
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
@@ -401,6 +482,50 @@ function upsertUser({ id, email, displayName, avatarUrl, provider }) {
     favoriteShowIds:  existing?.favoriteShowIds  ?? [],
     watchlistTopics:  existing?.watchlistTopics  ?? [],
     createdAt:        existing?.createdAt         ?? new Date().toISOString(),
+  };
+  _users.set(id, user);
+
+  // Persist to PostgreSQL asynchronously (non-blocking)
+  if (_pool) {
+    const prefs = JSON.stringify(user.preferences);
+    dbQuery(`
+      INSERT INTO users (id, email, display_name, avatar_url, provider, subscription_tier, preferences)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+      ON CONFLICT (id) DO UPDATE SET
+        email         = COALESCE(EXCLUDED.email, users.email),
+        display_name  = COALESCE(EXCLUDED.display_name, users.display_name),
+        avatar_url    = COALESCE(EXCLUDED.avatar_url, users.avatar_url),
+        updated_at    = NOW()
+    `, [id, user.email, user.displayName, user.avatarUrl, provider, user.subscriptionTier, prefs])
+      .catch((e) => console.warn('[db] upsertUser error:', e.message));
+  }
+
+  return user;
+}
+
+/** Load a user from PostgreSQL into the in-memory cache. */
+async function loadUserFromDb(id) {
+  const res = await dbQuery('SELECT * FROM users WHERE id = $1', [id]);
+  if (!res || !res.rows.length) return null;
+  const row = res.rows[0];
+  const user = {
+    id: row.id,
+    email: row.email,
+    displayName: row.display_name,
+    avatarUrl: row.avatar_url,
+    provider: row.provider,
+    subscriptionTier: row.subscription_tier,
+    preferences: row.preferences ?? {
+      notificationTopics: ['breaking', 'live_alerts'],
+      preferredCategories: ['politica', 'extern', 'economie'],
+      autoplayVideos: true,
+      highQualityStreaming: false,
+      darkMode: true,
+    },
+    savedArticleIds: row.saved_article_ids ?? [],
+    favoriteShowIds: row.favorite_show_ids ?? [],
+    watchlistTopics: row.watchlist_topics  ?? [],
+    createdAt: row.created_at,
   };
   _users.set(id, user);
   return user;
@@ -648,25 +773,178 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /auth/register ───────────────────────────────────────────────────
+  if (req.method === 'POST' && url === '/auth/register') {
+    res.setHeader('Content-Type', 'application/json');
+    const body = await readBody(req);
+    const { email, password, displayName } = body;
+    if (!email || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'Email și parola sunt obligatorii' })); return; }
+    if (password.length < 8) { res.writeHead(400); res.end(JSON.stringify({ error: 'Parola trebuie să aibă cel puțin 8 caractere' })); return; }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { res.writeHead(400); res.end(JSON.stringify({ error: 'Adresă de email invalidă' })); return; }
+
+    // Check if email already exists
+    const existing = await dbQuery('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+    if (existing && existing.rows.length > 0) { res.writeHead(409); res.end(JSON.stringify({ error: 'Există deja un cont cu acest email' })); return; }
+
+    const userId   = `email:${crypto.randomBytes(16).toString('hex')}`;
+    const pwHash   = hashPassword(password);
+    const name     = displayName || email.split('@')[0];
+    const defPrefs = { notificationTopics: ['breaking', 'live_alerts'], preferredCategories: ['politica', 'extern', 'economie'], autoplayVideos: true, highQualityStreaming: false, darkMode: true };
+
+    await dbQuery(
+      `INSERT INTO users (id, email, password_hash, display_name, provider, preferences)
+       VALUES ($1, $2, $3, $4, 'email', $5)`,
+      [userId, email.toLowerCase(), pwHash, name, JSON.stringify(defPrefs)],
+    );
+
+    const user = { id: userId, email: email.toLowerCase(), displayName: name, avatarUrl: null, provider: 'email', subscriptionTier: 'free', preferences: defPrefs, savedArticleIds: [], favoriteShowIds: [], watchlistTopics: [], createdAt: new Date().toISOString() };
+    _users.set(userId, user);
+    const token = jwtSign({ sub: userId, email: user.email });
+    console.log(`[auth] Register: ${email}`);
+    res.writeHead(201);
+    res.end(JSON.stringify({ token, user }));
+    return;
+  }
+
+  // ── POST /auth/login ──────────────────────────────────────────────────────
+  if (req.method === 'POST' && url === '/auth/login') {
+    res.setHeader('Content-Type', 'application/json');
+    const body = await readBody(req);
+    const { email, password } = body;
+    if (!email || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'Email și parola sunt obligatorii' })); return; }
+
+    const result = await dbQuery('SELECT * FROM users WHERE email = $1 AND provider = \'email\'', [email.toLowerCase()]);
+    if (!result || !result.rows.length) { res.writeHead(401); res.end(JSON.stringify({ error: 'Email sau parolă incorectă' })); return; }
+
+    const row = result.rows[0];
+    if (!verifyPassword(password, row.password_hash)) { res.writeHead(401); res.end(JSON.stringify({ error: 'Email sau parolă incorectă' })); return; }
+
+    const user = { id: row.id, email: row.email, displayName: row.display_name, avatarUrl: row.avatar_url, provider: 'email', subscriptionTier: row.subscription_tier, preferences: row.preferences ?? {}, savedArticleIds: row.saved_article_ids ?? [], favoriteShowIds: row.favorite_show_ids ?? [], watchlistTopics: row.watchlist_topics ?? [], createdAt: row.created_at };
+    _users.set(row.id, user);
+    const token = jwtSign({ sub: row.id, email: row.email });
+    console.log(`[auth] Login: ${email}`);
+    res.writeHead(200);
+    res.end(JSON.stringify({ token, user }));
+    return;
+  }
+
+  // ── POST /auth/forgot-password ────────────────────────────────────────────
+  if (req.method === 'POST' && url === '/auth/forgot-password') {
+    res.setHeader('Content-Type', 'application/json');
+    const body = await readBody(req);
+    const { email } = body;
+    if (!email) { res.writeHead(400); res.end(JSON.stringify({ error: 'Email obligatoriu' })); return; }
+
+    const result = await dbQuery('SELECT id FROM users WHERE email = $1 AND provider = \'email\'', [email.toLowerCase()]);
+    // Always respond OK to prevent email enumeration
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, message: 'Dacă emailul există, vei primi instrucțiuni de resetare.' }));
+
+    if (result && result.rows.length > 0) {
+      const userId = result.rows[0].id;
+      const token  = crypto.randomBytes(32).toString('hex');
+      const expiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+      await dbQuery(
+        'INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)',
+        [userId, token, expiry],
+      );
+      const resetUrl = `https://b1tv-proxy-production.up.railway.app/reset-password?token=${token}`;
+      await sendEmail({
+        to: email.toLowerCase(),
+        subject: 'Resetare parolă B1 TV',
+        html: `<div style="font-family:sans-serif;max-width:480px;margin:auto"><h2 style="color:#E8000D">B1 TV — Resetare parolă</h2><p>Ai solicitat resetarea parolei contului tău.</p><p><a href="${resetUrl}" style="background:#E8000D;color:white;padding:12px 24px;border-radius:6px;text-decoration:none;display:inline-block">Resetează parola</a></p><p style="color:#888;font-size:12px">Link-ul expiră în 1 oră. Dacă nu ai solicitat resetarea, ignoră acest email.</p></div>`,
+      });
+      console.log(`[auth] Reset token sent to ${email}`);
+    }
+    return;
+  }
+
+  // ── POST /auth/reset-password ─────────────────────────────────────────────
+  if (req.method === 'POST' && url === '/auth/reset-password') {
+    res.setHeader('Content-Type', 'application/json');
+    const body = await readBody(req);
+    const { token, password } = body;
+    if (!token || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'Token și parola sunt obligatorii' })); return; }
+    if (password.length < 8) { res.writeHead(400); res.end(JSON.stringify({ error: 'Parola trebuie să aibă cel puțin 8 caractere' })); return; }
+
+    const result = await dbQuery(
+      'SELECT * FROM password_reset_tokens WHERE token = $1 AND used = FALSE AND expires_at > NOW()',
+      [token],
+    );
+    if (!result || !result.rows.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'Token invalid sau expirat' })); return; }
+
+    const resetRow = result.rows[0];
+    const pwHash   = hashPassword(password);
+    await dbQuery('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [pwHash, resetRow.user_id]);
+    await dbQuery('UPDATE password_reset_tokens SET used = TRUE WHERE id = $1', [resetRow.id]);
+    console.log(`[auth] Password reset for user ${resetRow.user_id}`);
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  // ── GET /reset-password (web page for email link) ─────────────────────────
+  if (req.method === 'GET' && url.startsWith('/reset-password')) {
+    const token = new URL(`http://x${url}`).searchParams.get('token');
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.writeHead(200);
+    res.end(`<!DOCTYPE html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Resetare parolă — B1 TV</title><style>*{box-sizing:border-box}body{font-family:sans-serif;background:#0A0A0F;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}form{background:#1a1a2e;padding:32px;border-radius:12px;width:100%;max-width:400px}h2{color:#E8000D;margin:0 0 24px}input{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#0A0A0F;color:#fff;font-size:16px;margin-bottom:16px}button{width:100%;padding:14px;background:#E8000D;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:700;cursor:pointer}#msg{margin-top:16px;color:#4CAF50;display:none}#err{margin-top:16px;color:#ff4444;display:none}</style></head><body><form id="f"><h2>Parolă nouă</h2><input type="password" id="p1" placeholder="Parolă nouă" minlength="8" required><input type="password" id="p2" placeholder="Confirmă parola" required><button type="submit">Salvează parola</button><div id="msg">✓ Parola a fost schimbată! Poți reveni în aplicație.</div><div id="err"></div></form><script>document.getElementById('f').onsubmit=async(e)=>{e.preventDefault();const p1=document.getElementById('p1').value,p2=document.getElementById('p2').value;if(p1!==p2){document.getElementById('err').textContent='Parolele nu coincid';document.getElementById('err').style.display='block';return;}const r=await fetch('/auth/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:'${token}',password:p1})});const d=await r.json();if(d.ok){document.getElementById('msg').style.display='block';document.getElementById('f').querySelector('button').disabled=true;}else{document.getElementById('err').textContent=d.error||'Eroare';document.getElementById('err').style.display='block';}};</script></body></html>`);
+    return;
+  }
+
+  // ── DELETE /auth/me ───────────────────────────────────────────────────────
+  if (req.method === 'DELETE' && url === '/auth/me') {
+    res.setHeader('Content-Type', 'application/json');
+    const claims = getAuthUser(req);
+    if (!claims) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+    _users.delete(claims.sub);
+    await dbQuery('DELETE FROM users WHERE id = $1', [claims.sub]);
+    console.log(`[auth] Account deleted: ${claims.sub}`);
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  // ── PATCH /auth/me ────────────────────────────────────────────────────────
+  if (req.method === 'PATCH' && url === '/auth/me') {
+    res.setHeader('Content-Type', 'application/json');
+    const claims = getAuthUser(req);
+    if (!claims) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+    let user = _users.get(claims.sub) || await loadUserFromDb(claims.sub);
+    if (!user) { res.writeHead(404); res.end(JSON.stringify({ error: 'User not found' })); return; }
+    const body = await readBody(req);
+    const { displayName, currentPassword, newPassword } = body;
+
+    if (newPassword) {
+      if (user.provider !== 'email') { res.writeHead(400); res.end(JSON.stringify({ error: 'Schimbarea parolei e disponibilă doar pentru conturile email' })); return; }
+      const row = await dbQuery('SELECT password_hash FROM users WHERE id = $1', [claims.sub]);
+      if (!row || !row.rows.length || !verifyPassword(currentPassword || '', row.rows[0].password_hash)) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Parola curentă incorectă' })); return;
+      }
+      await dbQuery('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2', [hashPassword(newPassword), claims.sub]);
+    }
+
+    if (displayName) {
+      user.displayName = displayName;
+      _users.set(claims.sub, user);
+      await dbQuery('UPDATE users SET display_name = $1, updated_at = NOW() WHERE id = $2', [displayName, claims.sub]);
+    }
+
+    res.writeHead(200);
+    res.end(JSON.stringify(user));
+    return;
+  }
+
   // ── GET /auth/me ───────────────────────────────────────────────────────────
   if (req.method === 'GET' && url === '/auth/me') {
     res.setHeader('Content-Type', 'application/json');
     const claims = getAuthUser(req);
     if (!claims) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
-    let user = _users.get(claims.sub);
+    let user = _users.get(claims.sub) || await loadUserFromDb(claims.sub);
     if (!user) {
-      // Railway restarted — in-memory _users is empty but JWT is still valid.
-      // Re-create a minimal user object from the JWT claims so the app session
-      // survives server restarts without forcing a new login.
-      const provider = claims.sub.startsWith('apple:') ? 'apple' : 'google';
-      user = upsertUser({
-        id: claims.sub,
-        email: claims.email ?? '',
-        displayName: claims.email?.split('@')[0] ?? 'Utilizator',
-        avatarUrl: null,
-        provider,
-      });
-      console.log(`[auth] /auth/me — user recreated from JWT after restart: ${claims.sub}`);
+      const provider = claims.sub.startsWith('apple:') ? 'apple' : claims.sub.startsWith('google:') ? 'google' : 'email';
+      user = upsertUser({ id: claims.sub, email: claims.email ?? '', displayName: claims.email?.split('@')[0] ?? 'Utilizator', avatarUrl: null, provider });
+      console.log(`[auth] /auth/me — user recreated from JWT: ${claims.sub}`);
     }
     res.writeHead(200);
     res.end(JSON.stringify(user));
