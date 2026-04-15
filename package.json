@@ -7,8 +7,10 @@
     "start": "node server.js"
   },
   "dependencies": {
+    "pg": "^8.13.3",
     "puppeteer": "^22.15.0",
-    "pg": "^8.13.3"
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "engines": {
     "node": ">=18"

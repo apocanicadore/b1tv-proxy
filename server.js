@@ -27,7 +27,10 @@
 const http      = require('http');
 const https     = require('https');
 const crypto    = require('crypto');
-const puppeteer = require('puppeteer');
+const puppeteerExtra = require('puppeteer-extra');
+const StealthPlugin  = require('puppeteer-extra-plugin-stealth');
+puppeteerExtra.use(StealthPlugin());
+const puppeteer = puppeteerExtra;
 const { Pool }  = require('pg');
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -37,10 +40,14 @@ const WAIT_MS     = 45_000;
 // 1-hour cache — CDN token is valid for 6 h; Puppeteer cold-starts are expensive.
 const CACHE_TTL   = 60 * 60 * 1000;
 
-const MOBILE_UA =
-  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) ' +
-  'AppleWebKit/605.1.15 (KHTML, like Gecko) ' +
-  'Version/17.0 Mobile/15E148 Safari/604.1';
+// Desktop Chrome UA — must match the actual Chromium browser fingerprint.
+// Using iPhone Safari on a headless Chromium is detectable; use a real Chrome UA instead.
+const DESKTOP_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) ' +
+  'AppleWebKit/537.36 (KHTML, like Gecko) ' +
+  'Chrome/124.0.0.0 Safari/537.36';
+// Keep alias for CDN relay requests
+const MOBILE_UA = DESKTOP_UA;
 
 // ── Scoring ───────────────────────────────────────────────────────────────────
 
@@ -221,6 +228,9 @@ async function getBrowser() {
       '--disable-dev-shm-usage',
       '--disable-gpu',
       '--autoplay-policy=no-user-gesture-required',
+      '--window-size=1920,1080',
+      '--disable-blink-features=AutomationControlled',
+      '--lang=ro-RO,ro',
     ],
   });
   _browser.on('disconnected', () => {
@@ -244,7 +254,12 @@ async function resolveFromPage() {
   let earlyResolve = () => {};
   const earlyPromise = new Promise((res) => { earlyResolve = res; });
 
-  await page.setUserAgent(MOBILE_UA);
+  await page.setUserAgent(DESKTOP_UA);
+  await page.setViewport({ width: 1920, height: 1080 });
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+  });
   await page.setRequestInterception(true);
 
   page.on('request', (req) => {
