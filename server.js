@@ -446,6 +446,14 @@ async function sendEmail({ to, subject, html }) {
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
 
+if (!process.env.JWT_SECRET) {
+  if (process.env.NODE_ENV === 'production') {
+    console.error('[FATAL] JWT_SECRET environment variable is required in production. Set it in Railway Variables.');
+    process.exit(1);
+  } else {
+    console.warn('[WARN] JWT_SECRET not set — using ephemeral key. All sessions will be invalidated on restart. Set JWT_SECRET for persistent sessions.');
+  }
+}
 const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('hex');
 // In-memory user store: Map<userId, user-object>
 const _users = new Map();
@@ -478,12 +486,82 @@ function getAuthUser(req) {
   try { return jwtVerify(token); } catch { return null; }
 }
 
-/** Decode (not verify) a JWT — used for Apple identity tokens (RS256). */
-function jwtDecode(token) {
-  const parts = (token || '').split('.');
-  if (parts.length < 2) return null;
-  try { return JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')); }
-  catch { return null; }
+// ── Apple Sign-In JWKS verification ───────────────────────────────────────────
+// Apple public keys are cached for 24 h; token signature is verified with RS256.
+let _appleJwks = null;
+let _appleJwksCachedAt = 0;
+const APPLE_JWKS_TTL_MS = 24 * 60 * 60 * 1000;
+
+function fetchAppleJwks() {
+  if (_appleJwks && Date.now() - _appleJwksCachedAt < APPLE_JWKS_TTL_MS) {
+    return Promise.resolve(_appleJwks);
+  }
+  return new Promise((resolve, reject) => {
+    const req = https.get(
+      'https://appleid.apple.com/auth/keys',
+      { timeout: 8_000 },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(Buffer.concat(chunks).toString());
+            _appleJwks = data.keys;
+            _appleJwksCachedAt = Date.now();
+            resolve(_appleJwks);
+          } catch (e) { reject(e); }
+        });
+        res.on('error', reject);
+      },
+    );
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Apple JWKS fetch timeout')); });
+  });
+}
+
+/**
+ * Verify an Apple identityToken (RS256 JWT).
+ * Checks: signature (JWKS), iss, aud, exp.
+ * Requires Node >=18 (crypto.createPublicKey accepts JWK natively).
+ */
+async function verifyAppleToken(identityToken) {
+  const parts = (identityToken || '').split('.');
+  if (parts.length !== 3) throw new Error('Malformed Apple token');
+
+  let header, payload;
+  try {
+    header  = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  } catch { throw new Error('Cannot parse Apple token'); }
+
+  // 1. Expiry
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp && now > payload.exp) throw new Error('Apple token expired');
+
+  // 2. Issuer
+  if (payload.iss !== 'https://appleid.apple.com') throw new Error('Invalid Apple token issuer');
+
+  // 3. Audience (must match iOS bundle ID; also allow Service ID for web flows)
+  const BUNDLE_ID = process.env.APPLE_BUNDLE_ID || 'ro.b1tv.app';
+  if (payload.aud !== BUNDLE_ID) {
+    throw new Error(`Invalid Apple token audience: ${payload.aud} (expected ${BUNDLE_ID})`);
+  }
+
+  // 4. Find matching public key by kid
+  const keys = await fetchAppleJwks();
+  const jwk  = keys.find((k) => k.kid === header.kid);
+  if (!jwk) throw new Error(`Apple signing key not found (kid: ${header.kid})`);
+
+  // 5. Verify RS256 signature using Node.js built-in crypto
+  const publicKey    = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+  const signingInput = `${parts[0]}.${parts[1]}`;
+  const signature    = Buffer.from(parts[2], 'base64url');
+  const verifier     = crypto.createVerify('RSA-SHA256');
+  verifier.update(signingInput);
+  const valid = verifier.verify(publicKey, signature);
+  if (!valid) throw new Error('Apple token signature invalid');
+
+  return payload;
 }
 
 /** Call Google tokeninfo to verify an ID token and get email/name/picture. */
@@ -717,7 +795,16 @@ async function pollAndNotify() {
 
       const seen = _seenUrls.get(feed.url);
       const fresh = articles.filter((a) => a.link && !seen.has(a.link));
-      articles.forEach((a) => { if (a.link) seen.add(a.link); });
+      // Add new links to seen set; cap at 500 entries to prevent unbounded growth
+      articles.forEach((a) => {
+        if (!a.link) return;
+        seen.add(a.link);
+        if (seen.size > 500) {
+          // Delete the oldest entry (Sets preserve insertion order)
+          const oldest = seen.values().next().value;
+          seen.delete(oldest);
+        }
+      });
 
       if (!fresh.length) continue;
       console.log(`[push] ${fresh.length} new article(s) in ${feed.topic}`);
@@ -953,7 +1040,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  const url = req.url || '/';
+  // Normalize URL: strip query string for route matching to avoid bypasses
+  const url = (req.url || '/').split('?')[0].split('#')[0];
 
   // ── Rate limiting on sensitive endpoints ──────────────────────────────────
   const isAuthRoute = url.startsWith('/auth/');
@@ -1002,9 +1090,15 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     const { identityToken, fullName, email } = body;
     if (!identityToken) { res.writeHead(400); res.end(JSON.stringify({ error: 'Missing identityToken' })); return; }
-    // Decode without RS256 verification (token is short-lived; acceptable for MVP)
-    const claims = jwtDecode(identityToken);
-    if (!claims?.sub) { res.writeHead(401); res.end(JSON.stringify({ error: 'Invalid Apple token' })); return; }
+    let claims;
+    try {
+      claims = await verifyAppleToken(identityToken);
+    } catch (e) {
+      console.warn(`[auth] Apple token verification failed: ${e.message}`);
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: `Apple token invalid: ${e.message}` }));
+      return;
+    }
     const userId = `apple:${claims.sub}`;
     const resolvedEmail = email || claims.email || '';
     const resolvedName  = (fullName?.givenName && fullName?.familyName)
@@ -1012,7 +1106,7 @@ const server = http.createServer(async (req, res) => {
       : (fullName?.givenName || resolvedEmail.split('@')[0] || 'Utilizator');
     const user = upsertUser({ id: userId, email: resolvedEmail, displayName: resolvedName, avatarUrl: null, provider: 'apple' });
     const token = jwtSign({ sub: userId, email: user.email });
-    console.log(`[auth] Apple sign-in: ${resolvedEmail || userId}`);
+    console.log(`[auth] Apple sign-in verified: ${resolvedEmail || userId}`);
     res.writeHead(200);
     res.end(JSON.stringify({ token, user }));
     return;
@@ -1373,13 +1467,15 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /live-url — raw CDN URL (kept for diagnostics) ───────────────────
-  if (req.method === 'GET' && url !== '/live-url') {
+  // ── 404 catch-all (must be before the /live-url handler) ─────────────────
+  if (req.method !== 'GET' || url !== '/live-url') {
     res.setHeader('Content-Type', 'application/json');
     res.writeHead(404);
     res.end(JSON.stringify({ error: 'Not found. Endpoints: GET /hls, GET /hls-segment, GET /live-url, GET /polls, POST /polls/:id/vote' }));
     return;
   }
+
+  // ── GET /live-url — raw CDN URL (kept for diagnostics) ───────────────────
 
   console.log('\n[proxy] ← GET /live-url');
   res.setHeader('Content-Type', 'application/json');
