@@ -1316,7 +1316,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── GET /reset-password (web page for email link) ─────────────────────────
   if (req.method === 'GET' && url.startsWith('/reset-password')) {
-    const token = new URL(`http://x${url}`).searchParams.get('token');
+    const token = new URL(`http://x${req.url}`).searchParams.get('token');
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.writeHead(200);
     res.end(`<!DOCTYPE html><html lang="ro"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Resetare parolă — B1 TV</title><style>*{box-sizing:border-box}body{font-family:sans-serif;background:#0A0A0F;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}form{background:#1a1a2e;padding:32px;border-radius:12px;width:100%;max-width:400px}h2{color:#E8000D;margin:0 0 24px}input{width:100%;padding:12px;border-radius:8px;border:1px solid #333;background:#0A0A0F;color:#fff;font-size:16px;margin-bottom:16px}button{width:100%;padding:14px;background:#E8000D;color:#fff;border:none;border-radius:8px;font-size:16px;font-weight:700;cursor:pointer}#msg{margin-top:16px;color:#4CAF50;display:none}#err{margin-top:16px;color:#ff4444;display:none}</style></head><body><form id="f"><h2>Parolă nouă</h2><input type="password" id="p1" placeholder="Parolă nouă" minlength="8" required><input type="password" id="p2" placeholder="Confirmă parola" required><button type="submit">Salvează parola</button><div id="msg">✓ Parola a fost schimbată! Poți reveni în aplicație.</div><div id="err"></div></form><script>document.getElementById('f').onsubmit=async(e)=>{e.preventDefault();const p1=document.getElementById('p1').value,p2=document.getElementById('p2').value;if(p1!==p2){document.getElementById('err').textContent='Parolele nu coincid';document.getElementById('err').style.display='block';return;}const r=await fetch('/auth/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:'${token}',password:p1})});const d=await r.json();if(d.ok){document.getElementById('msg').style.display='block';document.getElementById('f').querySelector('button').disabled=true;}else{document.getElementById('err').textContent=d.error||'Eroare';document.getElementById('err').style.display='block';}};</script></body></html>`);
@@ -1508,7 +1508,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === 'GET' && url.startsWith('/hls-segment')) {
     let segUrl;
     try {
-      const qs  = new URL(`http://x${url}`).searchParams;
+      const qs  = new URL(`http://x${req.url}`).searchParams;
       segUrl    = qs.get('url');
     } catch {
       res.writeHead(400);
