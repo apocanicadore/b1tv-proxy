@@ -676,6 +676,14 @@ async function pollAndNotify() {
       console.log(`[push] ${fresh.length} new article(s) in ${feed.topic}`);
 
       for (const article of fresh.slice(0, 3)) {
+        // For the main /feed (mapped to 'breaking'), only notify if the title
+        // actually contains breaking-news keywords — otherwise it would fire
+        // for every monden/lifestyle/sport article published on the main feed.
+        const isMainFeed = feed.url.endsWith('/feed') && !feed.url.includes('/monden') &&
+          !feed.url.includes('/sport') && !feed.url.includes('/politic') &&
+          feed.url === 'https://www.b1tv.ro/feed';
+        if (isMainFeed && !BREAKING_RE.test(article.title)) continue;
+
         const isBreaking = feed.topic === 'breaking' || BREAKING_RE.test(article.title);
         const topic = isBreaking ? 'breaking' : feed.topic;
 
