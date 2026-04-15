@@ -795,16 +795,18 @@ async function buildAISummary() {
     return { summary: 'Nu există știri noi în ultimele 3 ore.', articles: [], generatedAt: new Date().toISOString(), articleCount: 0 };
   }
 
-  const headlines = unique.slice(0, 25)
+  const sourcesSlice = unique.slice(0, 25);
+  const headlines = sourcesSlice
     .map((item, i) => `${i + 1}. [${item.category}] ${item.title}`)
     .join('\n');
 
-  const prompt = `Ești un jurnalist senior la B1 TV România. Ai în față ${unique.length} titluri de știri publicate în ultimele 3 ore. Scrie o sinteză jurnalistică clară și concisă în română (200-280 cuvinte) care:
+  const prompt = `Ești un jurnalist senior la B1 TV România. Ai în față ${sourcesSlice.length} titluri de știri publicate în ultimele 3 ore. Scrie o sinteză jurnalistică clară și concisă în română (200-280 cuvinte) care:
 - Identifică cele mai importante subiecte ale momentului
 - Grupează subiectele înrudite
 - Folosește un ton obiectiv și profesional
 - Evidențiază ce e cu adevărat important față de ce e secundar
 - Nu enumera știrile una câte una — fă o sinteză fluentă
+- Ori de câte ori menționezi o știre specifică, adaugă imediat după referința ei numerică între paranteze drepte, de exemplu [3] sau [7]. Foloseşte cel puțin 5-8 astfel de referințe distribuite natural în text.
 
 Titlurile:
 ${headlines}
@@ -835,7 +837,8 @@ Sinteza:`;
 
   return {
     summary,
-    articles: unique.slice(0, 8).map((item) => ({
+    articles: sourcesSlice.map((item, i) => ({
+      index: i + 1,
       title: item.title,
       category: item.category,
       publishedAt: item.pubDate.toISOString(),
