@@ -717,6 +717,135 @@ setTimeout(async () => {
   console.log('[push] poller started — every 3 min');
 }, 20_000);
 
+// ── AI News Summary ───────────────────────────────────────────────────────────
+
+const AI_FEEDS = [
+  { url: 'https://www.b1tv.ro/feed',              category: 'breaking' },
+  { url: 'https://www.b1tv.ro/politica/feed',     category: 'politica' },
+  { url: 'https://www.b1tv.ro/externe/feed',      category: 'extern' },
+  { url: 'https://www.b1tv.ro/economic/feed',     category: 'economie' },
+  { url: 'https://www.b1tv.ro/eveniment/feed',    category: 'eveniment' },
+];
+
+const SUMMARY_CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+let _summaryCache = null;
+let _summaryCachedAt = 0;
+
+function fetchFeedXml(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, {
+      timeout: 8_000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148',
+        'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+  });
+}
+
+function parseRssItems(xml) {
+  const items = [];
+  const re = /<item[\s>]([\s\S]*?)<\/item>/gi;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const block = m[1];
+    const titleMatch = block.match(/<title[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
+    const title = (titleMatch?.[1] ?? '').trim().replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+    const pubDateMatch = block.match(/<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i);
+    const pubDate = pubDateMatch?.[1]?.trim() ?? '';
+    const linkMatch = block.match(/<link[^>]*>([\s\S]*?)<\/link>/i);
+    const link = linkMatch?.[1]?.trim() ?? '';
+    if (title && pubDate) items.push({ title, pubDate: new Date(pubDate), link });
+  }
+  return items;
+}
+
+async function buildAISummary() {
+  const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+
+  // Fetch all feeds in parallel
+  const feedResults = await Promise.allSettled(
+    AI_FEEDS.map(async ({ url, category }) => {
+      const xml = await fetchFeedXml(url);
+      return parseRssItems(xml).map((item) => ({ ...item, category }));
+    }),
+  );
+
+  const allItems = feedResults
+    .flatMap((r) => r.status === 'fulfilled' ? r.value : [])
+    .filter((item) => item.pubDate >= threeHoursAgo)
+    .sort((a, b) => b.pubDate - a.pubDate);
+
+  // Deduplicate by title similarity
+  const seen = new Set();
+  const unique = allItems.filter((item) => {
+    const key = item.title.toLowerCase().replace(/\s+/g, ' ').slice(0, 60);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  if (unique.length === 0) {
+    return { summary: 'Nu există știri noi în ultimele 3 ore.', articles: [], generatedAt: new Date().toISOString(), articleCount: 0 };
+  }
+
+  const headlines = unique.slice(0, 25)
+    .map((item, i) => `${i + 1}. [${item.category}] ${item.title}`)
+    .join('\n');
+
+  const prompt = `Ești un jurnalist senior la B1 TV România. Ai în față ${unique.length} titluri de știri publicate în ultimele 3 ore. Scrie o sinteză jurnalistică clară și concisă în română (200-280 cuvinte) care:
+- Identifică cele mai importante subiecte ale momentului
+- Grupează subiectele înrudite
+- Folosește un ton obiectiv și profesional
+- Evidențiază ce e cu adevărat important față de ce e secundar
+- Nu enumera știrile una câte una — fă o sinteză fluentă
+
+Titlurile:
+${headlines}
+
+Sinteza:`;
+
+  const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 500,
+      temperature: 0.4,
+    }),
+  });
+
+  if (!openaiRes.ok) {
+    const err = await openaiRes.text();
+    throw new Error(`OpenAI error ${openaiRes.status}: ${err.slice(0, 200)}`);
+  }
+
+  const openaiData = await openaiRes.json();
+  const summary = openaiData.choices?.[0]?.message?.content?.trim() ?? 'Sinteză indisponibilă.';
+
+  return {
+    summary,
+    articles: unique.slice(0, 8).map((item) => ({
+      title: item.title,
+      category: item.category,
+      publishedAt: item.pubDate.toISOString(),
+      link: item.link,
+    })),
+    generatedAt: new Date().toISOString(),
+    articleCount: unique.length,
+  };
+}
+
 // ── HTTP server ───────────────────────────────────────────────────────────────
 
 const server = http.createServer(async (req, res) => {
@@ -732,6 +861,37 @@ const server = http.createServer(async (req, res) => {
   }
 
   const url = req.url || '/';
+
+  // ── GET /ai-summary ───────────────────────────────────────────────────────
+  if (req.method === 'GET' && url === '/ai-summary') {
+    res.setHeader('Content-Type', 'application/json');
+    try {
+      // Serve from cache if fresh
+      if (_summaryCache && Date.now() - _summaryCachedAt < SUMMARY_CACHE_TTL_MS) {
+        console.log('[ai-summary] cache hit');
+        res.writeHead(200);
+        res.end(JSON.stringify({ ..._summaryCache, cached: true }));
+        return;
+      }
+      if (!process.env.OPENAI_API_KEY) {
+        res.writeHead(503);
+        res.end(JSON.stringify({ error: 'OPENAI_API_KEY not configured' }));
+        return;
+      }
+      console.log('[ai-summary] generating...');
+      const result = await buildAISummary();
+      _summaryCache = result;
+      _summaryCachedAt = Date.now();
+      res.writeHead(200);
+      res.end(JSON.stringify(result));
+      console.log(`[ai-summary] done — ${result.articleCount} articles`);
+    } catch (e) {
+      console.error('[ai-summary] error:', e.message);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
 
   // ── POST /auth/apple ──────────────────────────────────────────────────────
   if (req.method === 'POST' && url === '/auth/apple') {
