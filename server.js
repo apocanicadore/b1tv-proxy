@@ -33,7 +33,7 @@ const { Pool }  = require('pg');
 // ── Config ────────────────────────────────────────────────────────────────────
 const PORT        = process.env.PORT || 3031;
 const TARGET_PAGE = 'https://www.b1tv.ro/live';
-const WAIT_MS     = 25_000;
+const WAIT_MS     = 45_000;
 // 1-hour cache — CDN token is valid for 6 h; Puppeteer cold-starts are expensive.
 const CACHE_TTL   = 60 * 60 * 1000;
 
@@ -280,10 +280,10 @@ async function resolveFromPage() {
     });
     console.log('[proxy] page loaded — attempting to click video player…');
 
-    // Try to click play button / video element to trigger HLS autoplay
-    // (some browsers/CDNs require a user gesture)
+    // Aggressively trigger video playback in headless Chromium
     try {
       await page.evaluate(() => {
+        // 1. Click all known play button selectors
         const selectors = [
           'video',
           '.vjs-big-play-button',
@@ -291,16 +291,37 @@ async function resolveFromPage() {
           '[aria-label*="play"]',
           '[aria-label*="Play"]',
           'button[class*="play"]',
+          '[class*="Play"]',
+          '.play-button',
+          '#play-button',
         ];
         for (const sel of selectors) {
           const el = document.querySelector(sel);
-          if (el) { el.click(); return sel; }
+          if (el) { el.click(); }
         }
-        return null;
+        // 2. Force-play all video elements
+        document.querySelectorAll('video').forEach((v) => {
+          v.muted = true;
+          v.autoplay = true;
+          v.play().catch(() => {});
+        });
+        // 3. Dispatch synthetic user gesture events to unlock autoplay
+        document.dispatchEvent(new MouseEvent('click', { bubbles: true }));
       });
     } catch (e) {
-      console.log('[proxy] click attempt failed (non-fatal):', String(e).substring(0, 60));
+      console.log('[proxy] interaction attempt failed (non-fatal):', String(e).substring(0, 60));
     }
+
+    // Wait a bit more and try again
+    await new Promise((res) => setTimeout(res, 3_000));
+    try {
+      await page.evaluate(() => {
+        document.querySelectorAll('video').forEach((v) => {
+          v.muted = true;
+          v.play().catch(() => {});
+        });
+      });
+    } catch { /* non-fatal */ }
 
     console.log('[proxy] waiting for HLS request (max', WAIT_MS / 1000, 's)…');
     await Promise.race([
@@ -349,7 +370,13 @@ async function getHlsUrl() {
 
   _resolving = true;
   try {
-    const result = await resolveFromPage();
+    let result = await resolveFromPage();
+    // If first Puppeteer run gets score 0, retry once after a short pause
+    if (!result) {
+      console.log('[proxy] score 0 — retrying Puppeteer in 5 s…');
+      await new Promise((res) => setTimeout(res, 5_000));
+      result = await resolveFromPage();
+    }
     if (result) {
       _cache = { ...result, cachedAt: Date.now() };
       console.log('[proxy] cache updated →', result.url.substring(0, 100));
