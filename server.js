@@ -193,9 +193,12 @@ function rewriteM3u8(content, baseUrl, proxyBase) {
     if (!trimmed || trimmed.startsWith('#')) return line;
     try {
       const absUrl = new URL(trimmed, baseUrl).toString();
-      return `${proxyBase}/hls-segment?url=${encodeURIComponent(absUrl)}`;
+      // Encode CDN URL as base64url path to avoid Railway/Fastly WAF blocking
+      // requests that contain "token=" in the query string.
+      const encoded = Buffer.from(absUrl).toString('base64url');
+      return `${proxyBase}/seg/${encoded}`;
     } catch {
-      return line; // not a valid URL — leave as-is
+      return line;
     }
   }).join('\n');
 }
@@ -1504,7 +1507,45 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /hls-segment?url=... — proxy individual HLS segments from CDN ─────
+  // ── GET /seg/<base64url> — proxy individual HLS segments from CDN ──────────
+  // URL is base64url-encoded to avoid Railway/Fastly WAF blocking token= params.
+  if (req.method === 'GET' && url.startsWith('/seg/')) {
+    let segUrl;
+    try {
+      const encoded = url.slice('/seg/'.length);
+      segUrl = Buffer.from(encoded, 'base64url').toString('utf8');
+    } catch {
+      res.writeHead(400);
+      res.end('Bad request: cannot decode segment URL');
+      return;
+    }
+
+    if (!segUrl || !segUrl.includes('cdn.dejacast.com')) {
+      res.writeHead(400);
+      res.end('Invalid or untrusted segment URL');
+      return;
+    }
+
+    try {
+      const cdnRes = await cdnGet(segUrl);
+      res.setHeader('Content-Type', cdnRes.headers['content-type'] || 'video/MP2T');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      if (cdnRes.headers['content-length']) {
+        res.setHeader('Content-Length', cdnRes.headers['content-length']);
+      }
+      res.writeHead(cdnRes.statusCode);
+      cdnRes.pipe(res);
+    } catch (e) {
+      console.error('[proxy] /seg/ error:', e.message);
+      if (!res.headersSent) {
+        res.writeHead(502);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    }
+    return;
+  }
+
+  // ── GET /hls-segment?url=... — legacy endpoint (kept for backward compat) ──
   if (req.method === 'GET' && url.startsWith('/hls-segment')) {
     let segUrl;
     try {
