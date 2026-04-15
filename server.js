@@ -96,10 +96,52 @@ function buildPollResponse(poll) {
   return { ...poll, options, totalVotes };
 }
 
+// ── Rate limiter ──────────────────────────────────────────────────────────────
+// Sliding-window counters per IP. No external dependencies.
+const _rateLimitStore = new Map(); // ip -> { count, windowStart }
+
+function rateLimit(req, res, { maxRequests = 20, windowMs = 60_000 } = {}) {
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const entry = _rateLimitStore.get(ip);
+
+  if (!entry || now - entry.windowStart > windowMs) {
+    _rateLimitStore.set(ip, { count: 1, windowStart: now });
+    return false; // allowed
+  }
+
+  entry.count += 1;
+  if (entry.count > maxRequests) {
+    res.setHeader('Retry-After', Math.ceil(windowMs / 1000));
+    res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Too many requests' }));
+    return true; // blocked
+  }
+  return false; // allowed
+}
+
+// Clean stale entries every 5 minutes to avoid memory leaks
+setInterval(() => {
+  const cutoff = Date.now() - 5 * 60_000;
+  for (const [ip, entry] of _rateLimitStore) {
+    if (entry.windowStart < cutoff) _rateLimitStore.delete(ip);
+  }
+}, 5 * 60_000);
+
+const MAX_BODY_BYTES = 64 * 1024; // 64 KB
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', (chunk) => { data += chunk; });
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        req.destroy();
+        return reject(new Error('Request body too large'));
+      }
+      data += chunk;
+    });
     req.on('end', () => {
       try { resolve(JSON.parse(data || '{}')); }
       catch { resolve({}); }
@@ -325,7 +367,7 @@ async function getHlsUrl() {
 // ── PostgreSQL ────────────────────────────────────────────────────────────────
 
 const _pool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } })
+  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: process.env.DB_REJECT_UNAUTHORIZED !== 'false' } })
   : null;
 
 async function dbQuery(sql, params = []) {
@@ -408,9 +450,12 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('he
 // In-memory user store: Map<userId, user-object>
 const _users = new Map();
 
+const JWT_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+
 function jwtSign(payload) {
+  const now = Math.floor(Date.now() / 1000);
   const h = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-  const b = Buffer.from(JSON.stringify({ ...payload, iat: Math.floor(Date.now() / 1000) })).toString('base64url');
+  const b = Buffer.from(JSON.stringify({ ...payload, iat: now, exp: now + JWT_TTL_SECONDS })).toString('base64url');
   const s = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${b}`).digest('base64url');
   return `${h}.${b}.${s}`;
 }
@@ -421,7 +466,9 @@ function jwtVerify(token) {
   if (!h || !b || !s) throw new Error('Malformed token');
   const expected = crypto.createHmac('sha256', JWT_SECRET).update(`${h}.${b}`).digest('base64url');
   if (s !== expected) throw new Error('Invalid signature');
-  return JSON.parse(Buffer.from(b, 'base64url').toString('utf8'));
+  const payload = JSON.parse(Buffer.from(b, 'base64url').toString('utf8'));
+  if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) throw new Error('Token expired');
+  return payload;
 }
 
 function getAuthUser(req) {
@@ -870,11 +917,35 @@ ${headlines}`;
 
 // ── HTTP server ───────────────────────────────────────────────────────────────
 
+// Allowed CORS origins: Expo Go, local dev, and production Railway domain
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(o => o.trim())
+  .filter(Boolean);
+
+const DEFAULT_ALLOWED_ORIGINS = [
+  'https://b1tv.up.railway.app',
+  'exp://',          // Expo Go (prefix match handled below)
+  'http://localhost',
+];
+
+function corsOrigin(req) {
+  const origin = req.headers['origin'] || '';
+  if (!origin) return null; // native app requests have no Origin header
+  const allowed = [...DEFAULT_ALLOWED_ORIGINS, ...ALLOWED_ORIGINS];
+  if (allowed.some(o => origin === o || origin.startsWith(o))) return origin;
+  return null;
+}
+
 const server = http.createServer(async (req, res) => {
   // ── CORS ──────────────────────────────────────────────────────────────────
-  res.setHeader('Access-Control-Allow-Origin',  '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  const allowedOrigin = corsOrigin(req) || (process.env.NODE_ENV !== 'production' ? '*' : null);
+  if (allowedOrigin) {
+    res.setHeader('Access-Control-Allow-Origin',  allowedOrigin);
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PATCH, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Vary', 'Origin');
+  }
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -883,6 +954,16 @@ const server = http.createServer(async (req, res) => {
   }
 
   const url = req.url || '/';
+
+  // ── Rate limiting on sensitive endpoints ──────────────────────────────────
+  const isAuthRoute = url.startsWith('/auth/');
+  const isSensitive = isAuthRoute || url === '/ai-summary' || /^\/polls\/[^/]+\/vote$/.test(url);
+  if (isSensitive) {
+    const limits = isAuthRoute
+      ? { maxRequests: 10, windowMs: 60_000 }   // 10 auth calls / min
+      : { maxRequests: 30, windowMs: 60_000 };   // 30 calls / min for others
+    if (rateLimit(req, res, limits)) return;
+  }
 
   // ── GET /ai-summary ───────────────────────────────────────────────────────
   if (req.method === 'GET' && url === '/ai-summary') {
