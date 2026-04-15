@@ -800,18 +800,18 @@ async function buildAISummary() {
     .map((item, i) => `${i + 1}. [${item.category}] ${item.title}`)
     .join('\n');
 
-  const prompt = `Ești un jurnalist senior la B1 TV România. Ai în față ${sourcesSlice.length} titluri de știri publicate în ultimele 3 ore. Scrie o sinteză jurnalistică clară și concisă în română (200-280 cuvinte) care:
-- Identifică cele mai importante subiecte ale momentului
-- Grupează subiectele înrudite
-- Folosește un ton obiectiv și profesional
-- Evidențiază ce e cu adevărat important față de ce e secundar
-- Nu enumera știrile una câte una — fă o sinteză fluentă
-- Ori de câte ori menționezi o știre specifică, adaugă imediat după referința ei numerică între paranteze drepte, de exemplu [3] sau [7]. Foloseşte cel puțin 5-8 astfel de referințe distribuite natural în text.
+  const prompt = `Ești un jurnalist senior la B1 TV România. Ai în față ${sourcesSlice.length} titluri de știri publicate în ultimele 3 ore.
+
+Identifică cel mult 6 subiecte principale și pentru fiecare scrie:
+- un titlu scurt și clar (max 8 cuvinte)
+- un rezumat de 2-3 propoziții în română, obiectiv și profesional
+- numărul știrii din lista de mai jos care este cea mai relevantă sursă pentru acel subiect
+
+Răspunde EXCLUSIV cu un obiect JSON valid, fără text suplimentar, fără markdown, fără backtick-uri:
+{"topics":[{"title":"...","body":"...","article_index":N}]}
 
 Titlurile:
-${headlines}
-
-Sinteza:`;
+${headlines}`;
 
   const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -822,8 +822,9 @@ Sinteza:`;
     body: JSON.stringify({
       model: 'gpt-4o-mini',
       messages: [{ role: 'user', content: prompt }],
-      max_tokens: 500,
-      temperature: 0.4,
+      max_tokens: 700,
+      temperature: 0.3,
+      response_format: { type: 'json_object' },
     }),
   });
 
@@ -833,17 +834,27 @@ Sinteza:`;
   }
 
   const openaiData = await openaiRes.json();
-  const summary = openaiData.choices?.[0]?.message?.content?.trim() ?? 'Sinteză indisponibilă.';
+  const raw = openaiData.choices?.[0]?.message?.content?.trim() ?? '{"topics":[]}';
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { parsed = { topics: [] }; }
+
+  const topics = (parsed.topics ?? []).slice(0, 6).map((t) => {
+    const src = sourcesSlice[t.article_index - 1];
+    return {
+      title: t.title ?? '',
+      body: t.body ?? '',
+      article: src ? {
+        index: t.article_index,
+        title: src.title,
+        link: src.link,
+        category: src.category,
+        publishedAt: src.pubDate.toISOString(),
+      } : null,
+    };
+  });
 
   return {
-    summary,
-    articles: sourcesSlice.map((item, i) => ({
-      index: i + 1,
-      title: item.title,
-      category: item.category,
-      publishedAt: item.pubDate.toISOString(),
-      link: item.link,
-    })),
+    topics,
     generatedAt: new Date().toISOString(),
     articleCount: unique.length,
   };
