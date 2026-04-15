@@ -564,11 +564,19 @@ async function verifyAppleToken(identityToken) {
   return payload;
 }
 
-/** Call Google tokeninfo to verify an ID token and get email/name/picture. */
-function verifyGoogleToken(idToken) {
+// ── Google Sign-In JWKS verification ─────────────────────────────────────────
+// Replaces the deprecated tokeninfo endpoint with local RS256 verification.
+let _googleJwks = null;
+let _googleJwksCachedAt = 0;
+const GOOGLE_JWKS_TTL_MS = 6 * 60 * 60 * 1000; // 6 h (Google rotates keys ~daily)
+
+function fetchGoogleJwks() {
+  if (_googleJwks && Date.now() - _googleJwksCachedAt < GOOGLE_JWKS_TTL_MS) {
+    return Promise.resolve(_googleJwks);
+  }
   return new Promise((resolve, reject) => {
     const req = https.get(
-      `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
+      'https://www.googleapis.com/oauth2/v3/certs',
       { timeout: 8_000 },
       (res) => {
         const chunks = [];
@@ -576,15 +584,71 @@ function verifyGoogleToken(idToken) {
         res.on('end', () => {
           try {
             const data = JSON.parse(Buffer.concat(chunks).toString());
-            if (data.error) reject(new Error(data.error));
-            else resolve(data);
+            _googleJwks = data.keys;
+            _googleJwksCachedAt = Date.now();
+            resolve(_googleJwks);
           } catch (e) { reject(e); }
         });
+        res.on('error', reject);
       },
     );
     req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    req.on('timeout', () => { req.destroy(); reject(new Error('Google JWKS fetch timeout')); });
   });
+}
+
+/**
+ * Verify a Google ID token (RS256 JWT) locally.
+ * Checks: signature (JWKS), iss, aud (client IDs), exp.
+ * Returns the verified payload with sub, email, name, picture, etc.
+ */
+async function verifyGoogleToken(idToken) {
+  const parts = (idToken || '').split('.');
+  if (parts.length !== 3) throw new Error('Malformed Google token');
+
+  let header, payload;
+  try {
+    header  = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+  } catch { throw new Error('Cannot parse Google token'); }
+
+  // 1. Expiry
+  const now = Math.floor(Date.now() / 1000);
+  if (payload.exp && now > payload.exp) throw new Error('Google token expired');
+
+  // 2. Issuer
+  if (payload.iss !== 'accounts.google.com' && payload.iss !== 'https://accounts.google.com') {
+    throw new Error(`Invalid Google token issuer: ${payload.iss}`);
+  }
+
+  // 3. Audience — must match one of our configured client IDs
+  const allowedAuds = [
+    process.env.GOOGLE_WEB_CLIENT_ID,
+    process.env.GOOGLE_IOS_CLIENT_ID,
+    process.env.GOOGLE_ANDROID_CLIENT_ID,
+  ].filter(Boolean);
+
+  if (allowedAuds.length > 0 && !allowedAuds.includes(payload.aud)) {
+    throw new Error(`Invalid Google token audience: ${payload.aud}`);
+  }
+
+  // 4. Find matching public key by kid
+  const keys = await fetchGoogleJwks();
+  const jwk  = keys.find((k) => k.kid === header.kid);
+  if (!jwk) throw new Error(`Google signing key not found (kid: ${header.kid})`);
+
+  // 5. Verify RS256 signature (Node 18+ crypto supports JWK natively)
+  const publicKey    = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+  const signingInput = `${parts[0]}.${parts[1]}`;
+  const signature    = Buffer.from(parts[2], 'base64url');
+  const verifier     = crypto.createVerify('RSA-SHA256');
+  verifier.update(signingInput);
+  const valid = verifier.verify(publicKey, signature);
+  if (!valid) throw new Error('Google token signature invalid');
+
+  if (!payload.email_verified) throw new Error('Google email not verified');
+
+  return payload;
 }
 
 function upsertUser({ id, email, displayName, avatarUrl, provider }) {
@@ -1133,6 +1197,11 @@ const server = http.createServer(async (req, res) => {
   // ── POST /auth/register ───────────────────────────────────────────────────
   if (req.method === 'POST' && url === '/auth/register') {
     res.setHeader('Content-Type', 'application/json');
+    if (!_pool) {
+      res.writeHead(503);
+      res.end(JSON.stringify({ error: 'Înregistrarea prin email nu este disponibilă momentan' }));
+      return;
+    }
     const body = await readBody(req);
     const { email, password, displayName } = body;
     if (!email || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'Email și parola sunt obligatorii' })); return; }
@@ -1166,6 +1235,11 @@ const server = http.createServer(async (req, res) => {
   // ── POST /auth/login ──────────────────────────────────────────────────────
   if (req.method === 'POST' && url === '/auth/login') {
     res.setHeader('Content-Type', 'application/json');
+    if (!_pool) {
+      res.writeHead(503);
+      res.end(JSON.stringify({ error: 'Autentificarea prin email nu este disponibilă momentan' }));
+      return;
+    }
     const body = await readBody(req);
     const { email, password } = body;
     if (!email || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'Email și parola sunt obligatorii' })); return; }
