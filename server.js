@@ -1547,11 +1547,12 @@ const server = http.createServer(async (req, res) => {
     const messages = [];
     for (const [token] of _tokens) {
       messages.push({
-        to:    token,
-        sound: 'default',
-        title: title  || '🔴 B1 TV Breaking',
-        body:  message || 'Test notificare B1 TV',
-        data:  { topic: 'breaking', deepLink: link || 'b1tv://home' },
+        to:        token,
+        sound:     'default',
+        channelId: 'default',
+        title:     title  || '🔴 B1 TV Breaking',
+        body:      message || 'Test notificare B1 TV',
+        data:      { topic: 'breaking', deepLink: link || 'b1tv://home' },
       });
     }
     await sendExpoPush(messages);
