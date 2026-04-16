@@ -483,22 +483,63 @@ function verifyPassword(password, stored) {
   } catch { return false; }
 }
 
-// ── Email (Resend) ────────────────────────────────────────────────────────────
+// ── Email: SMTP (orice furnizor) sau Resend API ───────────────────────────────
+// Prioritate: dacă există SMTP_HOST → nodemailer; altfel Resend dacă există RESEND_API_KEY.
+// Variabile Railway (exemplu):
+//   SMTP_HOST=smtp.example.com  SMTP_PORT=587  SMTP_SECURE=false
+//   SMTP_USER=user  SMTP_PASS=secret  FROM_EMAIL="B1 TV <noreply@domeniu.ro>"
+
+const nodemailer = require('nodemailer');
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const FROM_EMAIL     = process.env.FROM_EMAIL || 'onboarding@resend.dev';
 
+let _smtpTransporter = null;
+function getSmtpTransporter() {
+  const host = process.env.SMTP_HOST;
+  if (!host) return null;
+  if (_smtpTransporter) return _smtpTransporter;
+  const port = Number(process.env.SMTP_PORT || 587);
+  const secure = process.env.SMTP_SECURE === 'true' || process.env.SMTP_SECURE === '1' || port === 465;
+  _smtpTransporter = nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: process.env.SMTP_USER
+      ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS || '' }
+      : undefined,
+  });
+  return _smtpTransporter;
+}
+
 async function sendEmail({ to, subject, html }) {
-  if (!RESEND_API_KEY) { console.warn('[email] No RESEND_API_KEY set'); return; }
-  try {
-    const res = await fetch('https://api.resend.com/emails', {
-      method:  'POST',
-      headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ from: FROM_EMAIL, to: [to], subject, html }),
-    });
-    if (!res.ok) console.warn('[email] Send failed:', await res.text());
-    else console.log('[email] Sent to', to);
-  } catch (e) { console.warn('[email] Error:', e.message); }
+  const from = FROM_EMAIL;
+
+  const smtp = getSmtpTransporter();
+  if (smtp) {
+    try {
+      await smtp.sendMail({ from, to, subject, html });
+      console.log('[email] SMTP →', to);
+    } catch (e) {
+      console.warn('[email] SMTP error:', e.message);
+    }
+    return;
+  }
+
+  if (RESEND_API_KEY) {
+    try {
+      const res = await fetch('https://api.resend.com/emails', {
+        method:  'POST',
+        headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ from, to: [to], subject, html }),
+      });
+      if (!res.ok) console.warn('[email] Resend failed:', await res.text());
+      else console.log('[email] Resend →', to);
+    } catch (e) { console.warn('[email] Resend error:', e.message); }
+    return;
+  }
+
+  console.warn('[email] No SMTP_HOST or RESEND_API_KEY — email disabled');
 }
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
