@@ -36,9 +36,12 @@ const { Pool }  = require('pg');
 // ── Config ────────────────────────────────────────────────────────────────────
 const PORT        = process.env.PORT || 3031;
 const TARGET_PAGE = 'https://www.b1tv.ro/live';
-const WAIT_MS     = 45_000;
-// 1-hour cache — CDN token is valid for 6 h; Puppeteer cold-starts are expensive.
-const CACHE_TTL   = 60 * 60 * 1000;
+// earlyResolve triggers immediately on score≥3; 20s is fallback for slower pages.
+const WAIT_MS     = 20_000;
+// 45-min cache — CDN token is valid for 6h; refresh well before expiry.
+const CACHE_TTL   = 45 * 60 * 1000;
+// Pre-warm interval: re-resolve silently every 40 min to keep cache fresh.
+const WARMUP_INTERVAL_MS = 40 * 60 * 1000;
 
 // Desktop Chrome UA — must match the actual Chromium browser fingerprint.
 // Using iPhone Safari on a headless Chromium is detectable; use a real Chrome UA instead.
@@ -1755,6 +1758,29 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('╚══════════════════════════════════════════════════════════╝');
   console.log('');
 });
+
+// ── Proactive warmup ──────────────────────────────────────────────────────────
+// Re-resolve the HLS URL every WARMUP_INTERVAL_MS so the cache is always fresh.
+// This means the first user to open the live tab gets an instant response
+// instead of waiting 20-45s for Puppeteer to cold-start.
+async function warmup() {
+  if (cacheValid()) {
+    console.log('[warmup] cache still valid — skipping');
+    return;
+  }
+  console.log('[warmup] refreshing HLS session proactively…');
+  try {
+    await getHlsUrl();
+    console.log('[warmup] done —', _cache.url.substring(0, 80));
+  } catch (e) {
+    console.warn('[warmup] failed:', e.message);
+  }
+}
+
+// Initial warmup 5s after server starts (gives Railway time to be fully ready)
+setTimeout(warmup, 5_000);
+// Periodic warmup
+setInterval(warmup, WARMUP_INTERVAL_MS);
 
 process.on('SIGINT',  async () => { if (_browser) await _browser.close(); process.exit(0); });
 process.on('SIGTERM', async () => { if (_browser) await _browser.close(); process.exit(0); });
