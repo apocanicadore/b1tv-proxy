@@ -411,8 +411,20 @@ async function getHlsUrl() {
 
 // ── PostgreSQL ────────────────────────────────────────────────────────────────
 
-const _pool = process.env.DATABASE_URL
-  ? new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: process.env.DB_REJECT_UNAUTHORIZED !== 'false' } })
+const _dbUrl = process.env.DATABASE_URL || '';
+const _isLocalPg = /localhost|127\.0\.0\.1/.test(_dbUrl);
+
+const _pool = _dbUrl
+  ? new Pool({
+    connectionString: _dbUrl,
+    ssl: _isLocalPg
+      ? false
+      : { rejectUnauthorized: process.env.DB_REJECT_UNAUTHORIZED !== 'false' },
+    max: 10,
+    connectionTimeoutMillis: 12_000,
+    idleTimeoutMillis: 30_000,
+    allowExitOnIdle: true,
+  })
   : null;
 
 async function dbQuery(sql, params = []) {
@@ -1247,33 +1259,38 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Înregistrarea prin email nu este disponibilă momentan' }));
       return;
     }
-    const body = await readBody(req);
-    const { email, password, displayName } = body;
-    if (!email || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'Email și parola sunt obligatorii' })); return; }
-    if (password.length < 8) { res.writeHead(400); res.end(JSON.stringify({ error: 'Parola trebuie să aibă cel puțin 8 caractere' })); return; }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { res.writeHead(400); res.end(JSON.stringify({ error: 'Adresă de email invalidă' })); return; }
+    try {
+      const body = await readBody(req);
+      const { email, password, displayName } = body;
+      if (!email || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'Email și parola sunt obligatorii' })); return; }
+      if (password.length < 8) { res.writeHead(400); res.end(JSON.stringify({ error: 'Parola trebuie să aibă cel puțin 8 caractere' })); return; }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { res.writeHead(400); res.end(JSON.stringify({ error: 'Adresă de email invalidă' })); return; }
 
-    // Check if email already exists
-    const existing = await dbQuery('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
-    if (existing && existing.rows.length > 0) { res.writeHead(409); res.end(JSON.stringify({ error: 'Există deja un cont cu acest email' })); return; }
+      const existing = await dbQuery('SELECT id FROM users WHERE email = $1', [email.toLowerCase()]);
+      if (existing && existing.rows.length > 0) { res.writeHead(409); res.end(JSON.stringify({ error: 'Există deja un cont cu acest email' })); return; }
 
-    const userId   = `email:${crypto.randomBytes(16).toString('hex')}`;
-    const pwHash   = hashPassword(password);
-    const name     = displayName || email.split('@')[0];
-    const defPrefs = { notificationTopics: ['breaking', 'live_alerts'], preferredCategories: ['politica', 'extern', 'economie'], autoplayVideos: true, highQualityStreaming: false, darkMode: true };
+      const userId   = `email:${crypto.randomBytes(16).toString('hex')}`;
+      const pwHash   = hashPassword(password);
+      const name     = displayName || email.split('@')[0];
+      const defPrefs = { notificationTopics: ['breaking', 'live_alerts'], preferredCategories: ['politica', 'extern', 'economie'], autoplayVideos: true, highQualityStreaming: false, darkMode: true };
 
-    await dbQuery(
-      `INSERT INTO users (id, email, password_hash, display_name, provider, preferences)
-       VALUES ($1, $2, $3, $4, 'email', $5)`,
-      [userId, email.toLowerCase(), pwHash, name, JSON.stringify(defPrefs)],
-    );
+      await dbQuery(
+        `INSERT INTO users (id, email, password_hash, display_name, provider, preferences)
+         VALUES ($1, $2, $3, $4, 'email', $5)`,
+        [userId, email.toLowerCase(), pwHash, name, JSON.stringify(defPrefs)],
+      );
 
-    const user = { id: userId, email: email.toLowerCase(), displayName: name, avatarUrl: null, provider: 'email', subscriptionTier: 'free', preferences: defPrefs, savedArticleIds: [], favoriteShowIds: [], watchlistTopics: [], createdAt: new Date().toISOString() };
-    _users.set(userId, user);
-    const token = jwtSign({ sub: userId, email: user.email });
-    console.log(`[auth] Register: ${email}`);
-    res.writeHead(201);
-    res.end(JSON.stringify({ token, user }));
+      const user = { id: userId, email: email.toLowerCase(), displayName: name, avatarUrl: null, provider: 'email', subscriptionTier: 'free', preferences: defPrefs, savedArticleIds: [], favoriteShowIds: [], watchlistTopics: [], createdAt: new Date().toISOString() };
+      _users.set(userId, user);
+      const token = jwtSign({ sub: userId, email: user.email });
+      console.log(`[auth] Register: ${email}`);
+      res.writeHead(201);
+      res.end(JSON.stringify({ token, user }));
+    } catch (e) {
+      console.error('[auth] register error:', e.message);
+      res.writeHead(503);
+      res.end(JSON.stringify({ error: 'Nu ne putem conecta la baza de date. Încearcă mai târziu sau verifică că serviciul PostgreSQL rulează pe Railway.' }));
+    }
     return;
   }
 
@@ -1285,22 +1302,28 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: 'Autentificarea prin email nu este disponibilă momentan' }));
       return;
     }
-    const body = await readBody(req);
-    const { email, password } = body;
-    if (!email || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'Email și parola sunt obligatorii' })); return; }
+    try {
+      const body = await readBody(req);
+      const { email, password } = body;
+      if (!email || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'Email și parola sunt obligatorii' })); return; }
 
-    const result = await dbQuery('SELECT * FROM users WHERE email = $1 AND provider = \'email\'', [email.toLowerCase()]);
-    if (!result || !result.rows.length) { res.writeHead(401); res.end(JSON.stringify({ error: 'Email sau parolă incorectă' })); return; }
+      const result = await dbQuery('SELECT * FROM users WHERE email = $1 AND provider = \'email\'', [email.toLowerCase()]);
+      if (!result || !result.rows.length) { res.writeHead(401); res.end(JSON.stringify({ error: 'Email sau parolă incorectă' })); return; }
 
-    const row = result.rows[0];
-    if (!verifyPassword(password, row.password_hash)) { res.writeHead(401); res.end(JSON.stringify({ error: 'Email sau parolă incorectă' })); return; }
+      const row = result.rows[0];
+      if (!verifyPassword(password, row.password_hash)) { res.writeHead(401); res.end(JSON.stringify({ error: 'Email sau parolă incorectă' })); return; }
 
-    const user = { id: row.id, email: row.email, displayName: row.display_name, avatarUrl: row.avatar_url, provider: 'email', subscriptionTier: row.subscription_tier, preferences: row.preferences ?? {}, savedArticleIds: row.saved_article_ids ?? [], favoriteShowIds: row.favorite_show_ids ?? [], watchlistTopics: row.watchlist_topics ?? [], createdAt: row.created_at };
-    _users.set(row.id, user);
-    const token = jwtSign({ sub: row.id, email: row.email });
-    console.log(`[auth] Login: ${email}`);
-    res.writeHead(200);
-    res.end(JSON.stringify({ token, user }));
+      const user = { id: row.id, email: row.email, displayName: row.display_name, avatarUrl: row.avatar_url, provider: 'email', subscriptionTier: row.subscription_tier, preferences: row.preferences ?? {}, savedArticleIds: row.saved_article_ids ?? [], favoriteShowIds: row.favorite_show_ids ?? [], watchlistTopics: row.watchlist_topics ?? [], createdAt: row.created_at };
+      _users.set(row.id, user);
+      const token = jwtSign({ sub: row.id, email: row.email });
+      console.log(`[auth] Login: ${email}`);
+      res.writeHead(200);
+      res.end(JSON.stringify({ token, user }));
+    } catch (e) {
+      console.error('[auth] login error:', e.message);
+      res.writeHead(503);
+      res.end(JSON.stringify({ error: 'Nu ne putem conecta la baza de date. Încearcă mai târziu.' }));
+    }
     return;
   }
 
@@ -1311,27 +1334,34 @@ const server = http.createServer(async (req, res) => {
     const { email } = body;
     if (!email) { res.writeHead(400); res.end(JSON.stringify({ error: 'Email obligatoriu' })); return; }
 
-    const result = await dbQuery('SELECT id FROM users WHERE email = $1 AND provider = \'email\'', [email.toLowerCase()]);
-    // Always respond OK to prevent email enumeration
+    // Răspunde imediat (anti-enumerare + evită 502 dacă DB e lent/indisponibil)
     res.writeHead(200);
     res.end(JSON.stringify({ ok: true, message: 'Dacă emailul există, vei primi instrucțiuni de resetare.' }));
 
-    if (result && result.rows.length > 0) {
-      const userId = result.rows[0].id;
-      const token  = crypto.randomBytes(32).toString('hex');
-      const expiry = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
-      await dbQuery(
-        'INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)',
-        [userId, token, expiry],
-      );
-      const resetUrl = `https://b1tv-proxy-production.up.railway.app/reset-password?token=${token}`;
-      await sendEmail({
-        to: email.toLowerCase(),
-        subject: 'Resetare parolă B1 TV',
-        html: `<div style="font-family:sans-serif;max-width:480px;margin:auto"><h2 style="color:#E8000D">B1 TV — Resetare parolă</h2><p>Ai solicitat resetarea parolei contului tău.</p><p><a href="${resetUrl}" style="background:#E8000D;color:white;padding:12px 24px;border-radius:6px;text-decoration:none;display:inline-block">Resetează parola</a></p><p style="color:#888;font-size:12px">Link-ul expiră în 1 oră. Dacă nu ai solicitat resetarea, ignoră acest email.</p></div>`,
-      });
-      console.log(`[auth] Reset token sent to ${email}`);
-    }
+    if (!_pool) return;
+    (async () => {
+      try {
+        const result = await dbQuery('SELECT id FROM users WHERE email = $1 AND provider = \'email\'', [email.toLowerCase()]);
+        if (result && result.rows.length > 0) {
+          const userId = result.rows[0].id;
+          const token  = crypto.randomBytes(32).toString('hex');
+          const expiry = new Date(Date.now() + 60 * 60 * 1000);
+          await dbQuery(
+            'INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES ($1, $2, $3)',
+            [userId, token, expiry],
+          );
+          const resetUrl = `https://b1tv-proxy-production.up.railway.app/reset-password?token=${token}`;
+          await sendEmail({
+            to: email.toLowerCase(),
+            subject: 'Resetare parolă B1 TV',
+            html: `<div style="font-family:sans-serif;max-width:480px;margin:auto"><h2 style="color:#E8000D">B1 TV — Resetare parolă</h2><p>Ai solicitat resetarea parolei contului tău.</p><p><a href="${resetUrl}" style="background:#E8000D;color:white;padding:12px 24px;border-radius:6px;text-decoration:none;display:inline-block">Resetează parola</a></p><p style="color:#888;font-size:12px">Link-ul expiră în 1 oră. Dacă nu ai solicitat resetarea, ignoră acest email.</p></div>`,
+          });
+          console.log(`[auth] Reset token sent to ${email}`);
+        }
+      } catch (e) {
+        console.error('[auth] forgot-password async:', e.message);
+      }
+    })();
     return;
   }
 
