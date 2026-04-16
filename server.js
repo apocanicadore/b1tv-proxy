@@ -1043,7 +1043,7 @@ async function buildAISummary() {
   });
 
   if (unique.length === 0) {
-    return { summary: 'Nu există știri noi în ultimele 3 ore.', articles: [], generatedAt: new Date().toISOString(), articleCount: 0 };
+    return { topics: [], generatedAt: new Date().toISOString(), articleCount: 0 };
   }
 
   const sourcesSlice = unique.slice(0, 25);
