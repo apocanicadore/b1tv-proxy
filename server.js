@@ -1534,6 +1534,33 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /admin/send-test ─────────────────────────────────────────────────
+  if (req.method === 'POST' && url === '/admin/send-test') {
+    res.setHeader('Content-Type', 'application/json');
+    const body = await readBody(req);
+    const { title, message, link } = body;
+    if (_tokens.size === 0) {
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: false, reason: 'No registered tokens', sent: 0 }));
+      return;
+    }
+    const messages = [];
+    for (const [token] of _tokens) {
+      messages.push({
+        to:    token,
+        sound: 'default',
+        title: title  || '🔴 B1 TV Breaking',
+        body:  message || 'Test notificare B1 TV',
+        data:  { topic: 'breaking', deepLink: link || 'b1tv://home' },
+      });
+    }
+    await sendExpoPush(messages);
+    console.log(`[push] test notification sent to ${messages.length} device(s)`);
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, sent: messages.length }));
+    return;
+  }
+
   // ── GET /polls ─────────────────────────────────────────────────────────────
   if (req.method === 'GET' && url === '/polls') {
     res.setHeader('Content-Type', 'application/json');
