@@ -19,6 +19,8 @@
  * - RSS poller every 3 min checks all B1TV category feeds
  * - New articles → Expo Push API notifies subscribed devices
  * - Breaking news detected by feed (main /feed) or title keywords
+ * - Non-breaking pushes: max 4 per device per clock hour (Europe/Bucharest);
+ *   breaking + earthquake stories bypass the cap; 00:00–07:59 RO only breaking/earthquake
  * - Tokens auto-expire after 24 h (re-registered on every app launch)
  */
 
@@ -825,7 +827,7 @@ async function loadUserFromDb(id) {
 
 /**
  * In-memory token store.
- * Map<expoPushToken, { topics: string[], registeredAt: number }>
+ * Map<expoPushToken, { topics, registeredAt, pushHourKey?, nonUrgentPushCount? }>
  * Tokens are re-registered on every app launch so ephemeral storage is fine.
  */
 const _tokens = new Map();
@@ -860,6 +862,57 @@ const TOPIC_LABELS = {
 };
 
 const BREAKING_RE = /EXCLUSIV|BREAKING|ALERT|ATEN[ȚT]IE|URGENT|ULTIMA\s+OR[ĂA]/i;
+
+/** Earthquake-related — may be sent outside night window and without hourly cap (like breaking). */
+const EARTHQUAKE_RE =
+  /cutremur|seism|magnitud|richter|USGS|epicent(r|u)|seismic|terremot|earthquake|replic(?:ă|a)|scara\s+Richter|intensitate/i;
+
+const PUSH_MAX_NON_URGENT_PER_HOUR = 4;
+const TZ_BUCHAREST = 'Europe/Bucharest';
+
+function getBucharestClockParts(date) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: TZ_BUCHAREST,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+  const get = (t) => parts.find((p) => p.type === t)?.value ?? '';
+  const h = get('hour');
+  return {
+    hourKey: `${get('year')}-${get('month')}-${get('day')}-${h}`,
+    hour: parseInt(h, 10),
+  };
+}
+
+/** 00:00–07:59 Bucharest — regular news suppressed; breaking & earthquake still sent. */
+function isNightQuietHoursBucharest(now = Date.now()) {
+  const { hour } = getBucharestClockParts(new Date(now));
+  return hour >= 0 && hour < 8;
+}
+
+function isEarthquakeStory(title, body) {
+  const t = `${title || ''} ${body || ''}`;
+  return EARTHQUAKE_RE.test(t);
+}
+
+/**
+ * Returns whether a non-breaking, non-earthquake notification may be sent and updates hourly counter.
+ * Breaking and earthquake always return true (no counter).
+ */
+function shouldEnqueueNonUrgentPush(tokenData, now = Date.now()) {
+  const { hourKey } = getBucharestClockParts(new Date(now));
+  if (tokenData.pushHourKey !== hourKey) {
+    tokenData.pushHourKey = hourKey;
+    tokenData.nonUrgentPushCount = 0;
+  }
+  const n = tokenData.nonUrgentPushCount || 0;
+  if (n >= PUSH_MAX_NON_URGENT_PER_HOUR) return false;
+  tokenData.nonUrgentPushCount = n + 1;
+  return true;
+}
 
 // ── RSS parser (no external deps) ────────────────────────────────────────────
 
@@ -947,6 +1000,9 @@ async function pollAndNotify() {
 
   console.log(`[push] poll — ${RSS_FEEDS.length} feeds, ${_tokens.size} device(s)`);
 
+  let skippedNight = 0;
+  let skippedRate = 0;
+
   for (const feed of RSS_FEEDS) {
     try {
       const articles = await fetchRssFeed(feed.url);
@@ -981,9 +1037,11 @@ async function pollAndNotify() {
         const isMainFeed = feed.url.endsWith('/feed') && !feed.url.includes('/monden') &&
           !feed.url.includes('/sport') && !feed.url.includes('/politic') &&
           feed.url === 'https://www.b1tv.ro/feed';
-        if (isMainFeed && !BREAKING_RE.test(article.title)) continue;
+        if (isMainFeed && !BREAKING_RE.test(article.title) &&
+          !isEarthquakeStory(article.title, article.body)) continue;
 
         const isBreaking = feed.topic === 'breaking' || BREAKING_RE.test(article.title);
+        const isEarthquake = isEarthquakeStory(article.title, article.body);
         const topic = isBreaking ? 'breaking' : feed.topic;
 
         const messages = [];
@@ -992,6 +1050,19 @@ async function pollAndNotify() {
           const wantsIt = topics.includes(topic) ||
             (isBreaking && (topics.includes('live_alerts') || topics.includes('breaking')));
           if (!wantsIt) continue;
+
+          const urgent = isBreaking || isEarthquake;
+          if (!urgent) {
+            if (isNightQuietHoursBucharest()) {
+              skippedNight++;
+              continue;
+            }
+            if (!shouldEnqueueNonUrgentPush(d)) {
+              skippedRate++;
+              continue;
+            }
+          }
+
           messages.push({
             to:        token,
             title:     isBreaking ? '🔴 BREAKING — B1 TV' : `B1 TV · ${TOPIC_LABELS[topic] ?? topic}`,
@@ -1011,6 +1082,10 @@ async function pollAndNotify() {
     } catch (e) {
       console.warn(`[push] feed error (${feed.topic}):`, e.message);
     }
+  }
+
+  if (skippedNight || skippedRate) {
+    console.log(`[push] suppressed night=${skippedNight} hourly_cap=${skippedRate} (${TZ_BUCHAREST})`);
   }
 }
 
@@ -1527,8 +1602,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     const validTopics = Array.isArray(topics) ? topics.filter((t) => typeof t === 'string') : [];
+    const platform = typeof body.platform === 'string' ? body.platform : 'unknown';
     _tokens.set(token, { topics: validTopics, registeredAt: Date.now() });
-    console.log(`[push] registered …${token.slice(-10)}  topics=[${validTopics.join(',')}]  total=${_tokens.size}`);
+    console.log(
+      `[push] registered …${token.slice(-10)}  platform=${platform}  topics=[${validTopics.join(',')}]  total=${_tokens.size}`,
+    );
     res.writeHead(200);
     res.end(JSON.stringify({ ok: true, topics: validTopics }));
     return;
