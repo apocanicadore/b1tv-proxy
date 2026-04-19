@@ -298,61 +298,108 @@ async function resolveFromPage() {
     await page.goto(TARGET_PAGE, { waitUntil: 'networkidle2', timeout: 30_000 }).catch(() => {
       console.log('[proxy] networkidle2 timeout — continuing anyway');
     });
-    console.log('[proxy] page loaded — attempting to click video player…');
 
-    // Aggressively trigger video playback in headless Chromium
+    // ── Fast-path: B1TV strawberry WP-JSON endpoint (sub-second) ──────────────
+    // After page.goto, the browser holds Cloudflare clearance cookies. Fetching
+    // the strawberry endpoint *from inside the page context* inherits those
+    // cookies → we get the signed CDN path directly without scraping network
+    // traffic for /tracks-*.m3u8 URLs (which never appear when CF challenges).
     try {
-      await page.evaluate(() => {
-        // 1. Click all known play button selectors
-        const selectors = [
-          'video',
-          '.vjs-big-play-button',
-          '[class*="play"]',
-          '[aria-label*="play"]',
-          '[aria-label*="Play"]',
-          'button[class*="play"]',
-          '[class*="Play"]',
-          '.play-button',
-          '#play-button',
-        ];
-        for (const sel of selectors) {
-          const el = document.querySelector(sel);
-          if (el) { el.click(); }
+      console.log('[proxy] trying strawberry fast-path…');
+      const fast = await page.evaluate(async () => {
+        try {
+          const res = await fetch('/wp-json/strawberry/v1/live?v=' + Date.now(), {
+            credentials: 'include',
+            headers: { Accept: 'application/json' },
+          });
+          if (!res.ok) return { error: 'http ' + res.status };
+          const text = await res.text();
+          let json;
+          try { json = JSON.parse(text); }
+          catch { return { error: 'non-json: ' + text.slice(0, 80) }; }
+          return { url: json && json.url };
+        } catch (e) {
+          return { error: String(e).slice(0, 100) };
         }
-        // 2. Force-play all video elements
-        document.querySelectorAll('video').forEach((v) => {
-          v.muted = true;
-          v.autoplay = true;
-          v.play().catch(() => {});
-        });
-        // 3. Dispatch synthetic user gesture events to unlock autoplay
-        document.dispatchEvent(new MouseEvent('click', { bubbles: true }));
       });
+
+      if (fast && fast.url && typeof fast.url === 'string') {
+        const decoded = decodeURIComponent(fast.url).replace(/^\/+/, '');
+        if (decoded.includes('.m3u8') && decoded.includes('token=')) {
+          const fullUrl = 'https://kea.cdn.dejacast.com/live/' + decoded;
+          console.log('[proxy] ★ strawberry fast-path SUCCESS:', fullUrl.substring(0, 120));
+          bestUrl   = fullUrl;
+          bestScore = 3;
+          bestSrc   = 'strawberry';
+          resolved  = true;
+        } else {
+          console.log('[proxy] strawberry returned unusable url:', decoded.substring(0, 80));
+        }
+      } else {
+        console.log('[proxy] strawberry fast-path failed:', fast && fast.error);
+      }
     } catch (e) {
-      console.log('[proxy] interaction attempt failed (non-fatal):', String(e).substring(0, 60));
+      console.log('[proxy] strawberry fast-path threw:', String(e).substring(0, 100));
     }
 
-    // Wait a bit more and try again
-    await new Promise((res) => setTimeout(res, 3_000));
-    try {
-      await page.evaluate(() => {
-        document.querySelectorAll('video').forEach((v) => {
-          v.muted = true;
-          v.play().catch(() => {});
-        });
-      });
-    } catch { /* non-fatal */ }
-
-    console.log('[proxy] waiting for HLS request (max', WAIT_MS / 1000, 's)…');
-    await Promise.race([
-      earlyPromise,
-      new Promise((res) => setTimeout(res, WAIT_MS)),
-    ]);
-
     if (resolved) {
-      console.log('[proxy] early exit — score-3 URL captured');
+      console.log('[proxy] skipping legacy scrape — strawberry succeeded');
     } else {
-      console.log('[proxy] timeout — best score so far:', bestScore);
+      console.log('[proxy] page loaded — attempting to click video player…');
+    }
+
+    // Legacy fallback: click play buttons + sniff network for /tracks-*.m3u8.
+    // Only runs if the strawberry fast-path didn't already resolve the URL.
+    if (!resolved) {
+      try {
+        await page.evaluate(() => {
+          const selectors = [
+            'video',
+            '.vjs-big-play-button',
+            '[class*="play"]',
+            '[aria-label*="play"]',
+            '[aria-label*="Play"]',
+            'button[class*="play"]',
+            '[class*="Play"]',
+            '.play-button',
+            '#play-button',
+          ];
+          for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el) { el.click(); }
+          }
+          document.querySelectorAll('video').forEach((v) => {
+            v.muted = true;
+            v.autoplay = true;
+            v.play().catch(() => {});
+          });
+          document.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+      } catch (e) {
+        console.log('[proxy] interaction attempt failed (non-fatal):', String(e).substring(0, 60));
+      }
+
+      await new Promise((res) => setTimeout(res, 3_000));
+      try {
+        await page.evaluate(() => {
+          document.querySelectorAll('video').forEach((v) => {
+            v.muted = true;
+            v.play().catch(() => {});
+          });
+        });
+      } catch { /* non-fatal */ }
+
+      console.log('[proxy] waiting for HLS request (max', WAIT_MS / 1000, 's)…');
+      await Promise.race([
+        earlyPromise,
+        new Promise((res) => setTimeout(res, WAIT_MS)),
+      ]);
+
+      if (resolved) {
+        console.log('[proxy] early exit — score-3 URL captured');
+      } else {
+        console.log('[proxy] timeout — best score so far:', bestScore);
+      }
     }
 
     // ── Capture session cookies for CDN relay ─────────────────────────────────
@@ -1848,6 +1895,20 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ error: e.message }));
     }
   }
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(
+      `[proxy] Cannot bind to port ${PORT}: already in use (EADDRINUSE).\n` +
+      `        Stop the other process using this port, e.g.:\n` +
+      `          lsof -ti :${PORT} | xargs kill\n` +
+      `        Or run on another port: PORT=3032 node proxy/server.js`,
+    );
+  } else {
+    console.error('[proxy] HTTP server error:', err.message);
+  }
+  process.exit(1);
 });
 
 server.listen(PORT, '0.0.0.0', () => {
