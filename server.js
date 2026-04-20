@@ -1291,6 +1291,11 @@ const _pollStats = {
   totalSkippedRate: 0,
   /** { [topic]: { lastFetchAt, articleCount, seenSize, freshCount, lastError, pushesSent } } */
   perFeed: {},
+  /**
+   * Ultimele decizii per articol din ultimul poll (max ~5). Ajută la diagnostic:
+   * „articol pe site dar fără push” → vezi outcome (topic URL, no subscribers, night, rate cap).
+   */
+  lastArticleDecisions: [],
 };
 
 async function pollAndNotify() {
@@ -1312,6 +1317,7 @@ async function pollAndNotify() {
   let skippedNight = 0;
   let skippedRate = 0;
   let pushesThisPoll = 0;
+  _pollStats.lastArticleDecisions = [];
 
   for (let feedIdx = 0; feedIdx < RSS_FEEDS.length; feedIdx++) {
     const feed = RSS_FEEDS[feedIdx];
@@ -1376,26 +1382,44 @@ async function pollAndNotify() {
         } else if (feed.topic === 'main') {
           topic = inferTopicFromUrl(article.link);
           // Articol fără categorie mapabilă → nu avem la cine să-l trimitem
-          if (!topic) continue;
+          if (!topic) {
+            _pollStats.lastArticleDecisions.push({
+              title: (article.title || '').slice(0, 140),
+              link:  article.link,
+              topic: null,
+              outcome: 'skipped_no_mappable_url_topic',
+              detail:
+                'Non-breaking article: URL path not in /politica/, /economic/, etc. Add keywords to title for breaking or extend URL_TOPIC_MAP.',
+            });
+            continue;
+          }
         } else {
           topic = feed.topic;
         }
 
         const messages = [];
+        let noInterest = 0;
+        let nightBlocks = 0;
+        let rateBlocks = 0;
         for (const [token, d] of _tokens) {
           const topics = d.topics || [];
           const wantsIt = topics.includes(topic) ||
             (isBreaking && (topics.includes('live_alerts') || topics.includes('breaking')));
-          if (!wantsIt) continue;
+          if (!wantsIt) {
+            noInterest++;
+            continue;
+          }
 
           const urgent = isBreaking || isEarthquake;
           if (!urgent) {
             if (isNightQuietHoursBucharest()) {
               skippedNight++;
+              nightBlocks++;
               continue;
             }
             if (!shouldEnqueueAndPersist(token, d)) {
               skippedRate++;
+              rateBlocks++;
               continue;
             }
           }
@@ -1417,6 +1441,32 @@ async function pollAndNotify() {
         }
         pushesThisPoll += messages.length;
         feedStat.pushesSent = (feedStat.pushesSent || 0) + messages.length;
+
+        const decision = {
+          title: (article.title || '').slice(0, 140),
+          link: article.link,
+          topic,
+          breaking: isBreaking,
+          pushesQueued: messages.length,
+          tokensTotal: _tokens.size,
+        };
+        if (messages.length === 0) {
+          decision.outcome = 'no_push_queued';
+          decision.breakdown = { noInterest, nightBlocks, rateBlocks };
+          if (noInterest === _tokens.size) {
+            decision.reasonHint =
+              'Niciun token nu are bifat acest topic. Breaking merge doar dacă ai breaking sau live_alerts.';
+          } else if (nightBlocks > 0 && rateBlocks === 0) {
+            decision.reasonHint = 'Fereastră noapte RO (00:00–07:59): push non-urgent suprimat pentru toți cei abonați.';
+          } else if (rateBlocks > 0 && nightBlocks === 0) {
+            decision.reasonHint = 'Cap orar (4 non-urgent/oră/device) atins pentru toți cei eligibili.';
+          } else {
+            decision.reasonHint = 'Combinație: unii fără topic, alții noapte sau cap orar — vezi breakdown.';
+          }
+        } else {
+          decision.outcome = 'sent_to_expo';
+        }
+        _pollStats.lastArticleDecisions.push(decision);
       }
       _pollStats.perFeed[feed.topic] = feedStat;
     } catch (e) {
