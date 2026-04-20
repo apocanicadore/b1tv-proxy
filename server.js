@@ -512,11 +512,23 @@ async function initSchema() {
       used       BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS push_tokens (
+      token            TEXT PRIMARY KEY,
+      topics           JSONB       NOT NULL DEFAULT '[]'::jsonb,
+      platform         TEXT,
+      registered_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      push_hour_key    TEXT,
+      non_urgent_count INT         NOT NULL DEFAULT 0,
+      updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_push_tokens_registered_at ON push_tokens(registered_at);
   `);
   console.log('[db] Schema ready');
 }
 
-initSchema().catch((e) => console.error('[db] Schema init error:', e.message));
+initSchema()
+  .then(() => loadTokensFromDb())
+  .catch((e) => console.error('[db] Schema init error:', e.message));
 
 // ── Password helpers ──────────────────────────────────────────────────────────
 
@@ -873,11 +885,109 @@ async function loadUserFromDb(id) {
 // ── Push Notifications ────────────────────────────────────────────────────────
 
 /**
- * In-memory token store.
- * Map<expoPushToken, { topics, registeredAt, pushHourKey?, nonUrgentPushCount? }>
- * Tokens are re-registered on every app launch so ephemeral storage is fine.
+ * In-memory token store (hot cache).
+ * Map<expoPushToken, { topics, registeredAt, pushHourKey?, nonUrgentPushCount?, platform? }>
+ *
+ * Persistență: token-urile sunt oglindite în tabelul Postgres `push_tokens` (upsert).
+ * La boot, `loadTokensFromDb()` populează _tokens din DB, astfel încât proxy-ul
+ * poate trimite notificări imediat după restart/redeploy — fără să aștepte ca
+ * aplicațiile să reînregistreze token-urile la următoarea deschidere.
  */
 const _tokens = new Map();
+
+/**
+ * Upsert un token + date în DB. Fire-and-forget: orice eroare e loghează dar
+ * nu propagă, pentru a nu bloca hot path-ul de notificare / înregistrare.
+ */
+async function upsertTokenInDb(token, data) {
+  if (!_pool) return;
+  try {
+    await dbQuery(
+      `INSERT INTO push_tokens (token, topics, platform, registered_at, push_hour_key, non_urgent_count, updated_at)
+       VALUES ($1, $2::jsonb, $3, to_timestamp($4 / 1000.0), $5, $6, NOW())
+       ON CONFLICT (token) DO UPDATE SET
+         topics           = EXCLUDED.topics,
+         platform         = COALESCE(EXCLUDED.platform, push_tokens.platform),
+         registered_at    = EXCLUDED.registered_at,
+         push_hour_key    = EXCLUDED.push_hour_key,
+         non_urgent_count = EXCLUDED.non_urgent_count,
+         updated_at       = NOW()`,
+      [
+        token,
+        JSON.stringify(data.topics || []),
+        data.platform || null,
+        Number(data.registeredAt) || Date.now(),
+        data.pushHourKey || null,
+        Number(data.nonUrgentPushCount) || 0,
+      ],
+    );
+  } catch (e) {
+    console.warn('[push][db] upsert failed:', e.message);
+  }
+}
+
+/** Actualizează doar contorii hourly-cap (apelat la fiecare push non-urgent). */
+async function persistRateLimitState(token, data) {
+  if (!_pool) return;
+  try {
+    await dbQuery(
+      `UPDATE push_tokens
+         SET push_hour_key = $2, non_urgent_count = $3, updated_at = NOW()
+       WHERE token = $1`,
+      [token, data.pushHourKey || null, Number(data.nonUrgentPushCount) || 0],
+    );
+  } catch (e) {
+    console.warn('[push][db] rate-limit persist failed:', e.message);
+  }
+}
+
+/** Șterge un token din DB (invocat când scoatem token-uri vechi din _tokens). */
+async function deleteTokenFromDb(token) {
+  if (!_pool) return;
+  try {
+    await dbQuery(`DELETE FROM push_tokens WHERE token = $1`, [token]);
+  } catch (e) {
+    console.warn('[push][db] delete failed:', e.message);
+  }
+}
+
+/**
+ * Populează _tokens la boot din Postgres. Rulată DUPĂ initSchema().
+ * Dacă DB nu e disponibilă, continuăm cu _tokens gol — aplicațiile vor
+ * reînregistra token-urile la următorul launch (fallback complet).
+ */
+async function loadTokensFromDb() {
+  if (!_pool) { console.log('[push][db] No DB — tokens ephemeral only'); return; }
+  try {
+    const result = await dbQuery(
+      `SELECT token, topics, platform, registered_at, push_hour_key, non_urgent_count
+         FROM push_tokens
+         WHERE registered_at > NOW() - INTERVAL '24 hours'`,
+    );
+    if (!result || !result.rows) return;
+    for (const row of result.rows) {
+      _tokens.set(row.token, {
+        topics:              Array.isArray(row.topics) ? row.topics : [],
+        platform:            row.platform || undefined,
+        registeredAt:        new Date(row.registered_at).getTime(),
+        pushHourKey:         row.push_hour_key || undefined,
+        nonUrgentPushCount:  Number(row.non_urgent_count) || 0,
+      });
+    }
+    console.log(`[push][db] Loaded ${_tokens.size} token(s) from DB`);
+    if (result.rows.length) {
+      // Curățăm DB-ul de token-urile expirate (>24h), o singură dată la boot.
+      const cleanup = await dbQuery(
+        `DELETE FROM push_tokens WHERE registered_at <= NOW() - INTERVAL '24 hours'`,
+      );
+      if (cleanup && cleanup.rowCount) {
+        console.log(`[push][db] Purged ${cleanup.rowCount} stale token(s)`);
+      }
+    }
+  } catch (e) {
+    console.warn('[push][db] load failed (continuing without persistence):', e.message);
+  }
+}
 
 /**
  * Per-feed set of already-seen article URLs.
@@ -959,6 +1069,21 @@ function shouldEnqueueNonUrgentPush(tokenData, now = Date.now()) {
   if (n >= PUSH_MAX_NON_URGENT_PER_HOUR) return false;
   tokenData.nonUrgentPushCount = n + 1;
   return true;
+}
+
+/**
+ * Wrapper peste `shouldEnqueueNonUrgentPush` care persist-ează contorii în DB
+ * la fiecare decizie pozitivă / schimbare de oră, ca să supraviețuiască la restart.
+ */
+function shouldEnqueueAndPersist(token, tokenData, now = Date.now()) {
+  const prevKey = tokenData.pushHourKey;
+  const prevN   = tokenData.nonUrgentPushCount || 0;
+  const ok = shouldEnqueueNonUrgentPush(tokenData, now);
+  // Persist doar dacă s-a schimbat ceva (să nu batem DB-ul inutil).
+  if (tokenData.pushHourKey !== prevKey || (tokenData.nonUrgentPushCount || 0) !== prevN) {
+    persistRateLimitState(token, tokenData).catch(() => { /* logat în helper */ });
+  }
+  return ok;
 }
 
 // ── RSS parser (no external deps) ────────────────────────────────────────────
@@ -1060,7 +1185,10 @@ async function pollAndNotify() {
   // Remove tokens older than 24 h (likely uninstalled devices)
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
   for (const [token, d] of _tokens) {
-    if (d.registeredAt < cutoff) { _tokens.delete(token); }
+    if (d.registeredAt < cutoff) {
+      _tokens.delete(token);
+      deleteTokenFromDb(token).catch(() => { /* logat în helper */ });
+    }
   }
 
   console.log(`[push] poll — ${RSS_FEEDS.length} feeds, ${_tokens.size} device(s)`);
@@ -1140,7 +1268,7 @@ async function pollAndNotify() {
               skippedNight++;
               continue;
             }
-            if (!shouldEnqueueNonUrgentPush(d)) {
+            if (!shouldEnqueueAndPersist(token, d)) {
               skippedRate++;
               continue;
             }
@@ -1698,7 +1826,17 @@ const server = http.createServer(async (req, res) => {
     }
     const validTopics = Array.isArray(topics) ? topics.filter((t) => typeof t === 'string') : [];
     const platform = typeof body.platform === 'string' ? body.platform : 'unknown';
-    _tokens.set(token, { topics: validTopics, registeredAt: Date.now() });
+    const existing = _tokens.get(token) || {};
+    const tokenData = {
+      topics:             validTopics,
+      platform,
+      registeredAt:       Date.now(),
+      pushHourKey:        existing.pushHourKey,
+      nonUrgentPushCount: existing.nonUrgentPushCount || 0,
+    };
+    _tokens.set(token, tokenData);
+    // Persist async — nu blocăm response-ul către client dacă DB e lentă.
+    upsertTokenInDb(token, tokenData).catch(() => { /* logat în helper */ });
     console.log(
       `[push] registered …${token.slice(-10)}  platform=${platform}  topics=[${validTopics.join(',')}]  total=${_tokens.size}`,
     );
