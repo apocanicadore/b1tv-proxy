@@ -1130,7 +1130,10 @@ const _rssFetchDiagnostics = new Map();
  * sistematic 0 articole de pe IP-ul Railway, în timp ce mergeau de pe workstation.
  * Cauza cea mai probabilă: un răspuns gzip nedecomprimat sau un redirect silențios.
  */
-async function fetchRssFeed(feedUrl) {
+/** Rate-limit state per host — backoff până la `retryAfterMs` următorul fetch. */
+const _rssBackoff = new Map(); // host → retryAfterTimestamp
+
+async function fetchRssFeedOnce(feedUrl) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 15_000);
   try {
@@ -1141,31 +1144,75 @@ async function fetchRssFeed(feedUrl) {
         'User-Agent':      MOBILE_UA,
         Accept:            'application/rss+xml, text/xml;q=0.9, */*;q=0.5',
         'Accept-Language': 'ro-RO,ro;q=0.9,en;q=0.6',
+        // Cloudflare acceptă requesturile cu Referer autentic (vezi-le ca
+        // fetch din pagina proprie, nu ca scraping pur). Fără asta, sub-feed-urile
+        // return 429 pe IP-urile de datacenter.
+        Referer:           'https://www.b1tv.ro/',
+        Origin:            'https://www.b1tv.ro',
+        Connection:        'keep-alive',
       },
     });
     clearTimeout(timer);
     const xml = await res.text();
     const bytes = xml.length;
-    if (!res.ok) {
-      _rssFetchDiagnostics.set(feedUrl, { status: res.status, bytes, items: 0, error: `HTTP ${res.status}` });
-      console.warn(`[push] RSS HTTP ${res.status} for ${feedUrl}`);
-      return [];
-    }
-    const items = parseRssFeed(xml);
-    _rssFetchDiagnostics.set(feedUrl, {
-      status: res.status,
-      bytes,
-      items: items.length,
-      error: items.length === 0 ? 'parsed-0-items' : null,
-    });
-    return items;
+    return { ok: res.ok, status: res.status, xml, bytes, retryAfter: res.headers.get('retry-after') };
   } catch (e) {
     clearTimeout(timer);
-    const msg = (e && e.message) || String(e);
-    _rssFetchDiagnostics.set(feedUrl, { status: 0, bytes: 0, items: 0, error: msg.slice(0, 120) });
-    console.warn('[push] RSS fetch error:', feedUrl, '—', msg.slice(0, 120));
+    return { ok: false, status: 0, xml: '', bytes: 0, error: (e && e.message) || String(e) };
+  }
+}
+
+/**
+ * Fetch + parse RSS.
+ *
+ * Folosește `fetch()` global (Node 18+) în loc de `https.get` brut pentru că:
+ *  - urmărește automat redirect-urile 301/302,
+ *  - decomprimă automat răspunsurile gzip/br,
+ *  - error-handling mai standardizat și timeout via AbortController.
+ *
+ * Backoff la 429: când Cloudflare întoarce rate-limit, marcăm host-ul cu
+ * retryAfterTimestamp; toate fetch-urile viitoare către acel host sar peste
+ * până se scurge timpul — polling-ul continuă pentru celelalte feed-uri.
+ */
+async function fetchRssFeed(feedUrl) {
+  const host = new URL(feedUrl).host;
+  const backoffUntil = _rssBackoff.get(host);
+  if (backoffUntil && backoffUntil > Date.now()) {
+    const secs = Math.round((backoffUntil - Date.now()) / 1000);
+    _rssFetchDiagnostics.set(feedUrl, {
+      status: 429, bytes: 0, items: 0, error: `backoff ${secs}s`,
+    });
     return [];
   }
+
+  const r = await fetchRssFeedOnce(feedUrl);
+  if (!r.ok) {
+    if (r.status === 429) {
+      const retryMs = Math.max(60_000, parseInt(r.retryAfter || '60', 10) * 1000);
+      _rssBackoff.set(host, Date.now() + retryMs);
+      console.warn(`[push] RSS 429 on ${feedUrl} — backoff ${retryMs / 1000}s for host ${host}`);
+    }
+    _rssFetchDiagnostics.set(feedUrl, {
+      status: r.status, bytes: r.bytes, items: 0,
+      error: r.error ? r.error.slice(0, 120) : `HTTP ${r.status}`,
+    });
+    return [];
+  }
+
+  let items = [];
+  try { items = parseRssFeed(r.xml); }
+  catch (e) {
+    _rssFetchDiagnostics.set(feedUrl, {
+      status: r.status, bytes: r.bytes, items: 0, error: `parse: ${e.message.slice(0, 60)}`,
+    });
+    return [];
+  }
+
+  _rssFetchDiagnostics.set(feedUrl, {
+    status: r.status, bytes: r.bytes, items: items.length,
+    error: items.length === 0 ? 'parsed-0-items' : null,
+  });
+  return items;
 }
 
 // ── Expo Push API sender ──────────────────────────────────────────────────────
@@ -1236,7 +1283,12 @@ async function pollAndNotify() {
   let skippedRate = 0;
   let pushesThisPoll = 0;
 
-  for (const feed of RSS_FEEDS) {
+  for (let feedIdx = 0; feedIdx < RSS_FEEDS.length; feedIdx++) {
+    const feed = RSS_FEEDS[feedIdx];
+    // Spread peste ~6s ca să nu declanșăm rate-limit Cloudflare (12 feed-uri * 500ms ≈ 6s).
+    // La primul feed sărim delay-ul — răspuns imediat la boot și la diagnostic.
+    if (feedIdx > 0) await new Promise((r) => setTimeout(r, 500));
+
     const feedStat = _pollStats.perFeed[feed.topic] ?? {};
     feedStat.lastFetchAt = new Date().toISOString();
     try {
