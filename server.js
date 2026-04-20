@@ -19,8 +19,7 @@
  * - RSS poller every 3 min checks all B1TV category feeds
  * - New articles → Expo Push API notifies subscribed devices
  * - Breaking news detected by feed (main /feed) or title keywords
- * - Non-breaking pushes: max 4 per device per clock hour (Europe/Bucharest);
- *   breaking + earthquake stories bypass the cap; 00:00–07:59 RO only breaking/earthquake
+ * - Non-breaking pushes: no hourly cap (removed); 00:00–07:59 RO only breaking/earthquake
  * - Tokens auto-expire after 24 h (re-registered on every app launch)
  */
 
@@ -886,7 +885,7 @@ async function loadUserFromDb(id) {
 
 /**
  * In-memory token store (hot cache).
- * Map<expoPushToken, { topics, registeredAt, pushHourKey?, nonUrgentPushCount?, platform? }>
+ * Map<expoPushToken, { topics, registeredAt, pushHourKey?, nonUrgentPushCount? (legacy), platform? }>
  *
  * Persistență: token-urile sunt oglindite în tabelul Postgres `push_tokens` (upsert).
  * La boot, `loadTokensFromDb()` populează _tokens din DB, astfel încât proxy-ul
@@ -923,21 +922,6 @@ async function upsertTokenInDb(token, data) {
     );
   } catch (e) {
     console.warn('[push][db] upsert failed:', e.message);
-  }
-}
-
-/** Actualizează doar contorii hourly-cap (apelat la fiecare push non-urgent). */
-async function persistRateLimitState(token, data) {
-  if (!_pool) return;
-  try {
-    await dbQuery(
-      `UPDATE push_tokens
-         SET push_hour_key = $2, non_urgent_count = $3, updated_at = NOW()
-       WHERE token = $1`,
-      [token, data.pushHourKey || null, Number(data.nonUrgentPushCount) || 0],
-    );
-  } catch (e) {
-    console.warn('[push][db] rate-limit persist failed:', e.message);
   }
 }
 
@@ -1054,7 +1038,6 @@ const BREAKING_RE = /EXCLUSIV|BREAKING|ALERT|ATEN[ȚT]IE|URGENT|ULTIMA\s+OR[ĂA]
 const EARTHQUAKE_RE =
   /cutremur|seism|magnitud|richter|USGS|epicent(r|u)|seismic|terremot|earthquake|replic(?:ă|a)|scara\s+Richter|intensitate/i;
 
-const PUSH_MAX_NON_URGENT_PER_HOUR = 4;
 const TZ_BUCHAREST = 'Europe/Bucharest';
 
 function getBucharestClockParts(date) {
@@ -1083,37 +1066,6 @@ function isNightQuietHoursBucharest(now = Date.now()) {
 function isEarthquakeStory(title, body) {
   const t = `${title || ''} ${body || ''}`;
   return EARTHQUAKE_RE.test(t);
-}
-
-/**
- * Returns whether a non-breaking, non-earthquake notification may be sent and updates hourly counter.
- * Breaking and earthquake always return true (no counter).
- */
-function shouldEnqueueNonUrgentPush(tokenData, now = Date.now()) {
-  const { hourKey } = getBucharestClockParts(new Date(now));
-  if (tokenData.pushHourKey !== hourKey) {
-    tokenData.pushHourKey = hourKey;
-    tokenData.nonUrgentPushCount = 0;
-  }
-  const n = tokenData.nonUrgentPushCount || 0;
-  if (n >= PUSH_MAX_NON_URGENT_PER_HOUR) return false;
-  tokenData.nonUrgentPushCount = n + 1;
-  return true;
-}
-
-/**
- * Wrapper peste `shouldEnqueueNonUrgentPush` care persist-ează contorii în DB
- * la fiecare decizie pozitivă / schimbare de oră, ca să supraviețuiască la restart.
- */
-function shouldEnqueueAndPersist(token, tokenData, now = Date.now()) {
-  const prevKey = tokenData.pushHourKey;
-  const prevN   = tokenData.nonUrgentPushCount || 0;
-  const ok = shouldEnqueueNonUrgentPush(tokenData, now);
-  // Persist doar dacă s-a schimbat ceva (să nu batem DB-ul inutil).
-  if (tokenData.pushHourKey !== prevKey || (tokenData.nonUrgentPushCount || 0) !== prevN) {
-    persistRateLimitState(token, tokenData).catch(() => { /* logat în helper */ });
-  }
-  return ok;
 }
 
 // ── RSS parser (no external deps) ────────────────────────────────────────────
@@ -1288,7 +1240,6 @@ const _pollStats = {
   totalPolls: 0,
   totalPushesSent: 0,
   totalSkippedNight: 0,
-  totalSkippedRate: 0,
   /** { [topic]: { lastFetchAt, articleCount, seenSize, freshCount, lastError, pushesSent } } */
   perFeed: {},
   /**
@@ -1315,7 +1266,6 @@ async function pollAndNotify() {
   console.log(`[push] poll — ${RSS_FEEDS.length} feeds, ${_tokens.size} device(s)`);
 
   let skippedNight = 0;
-  let skippedRate = 0;
   let pushesThisPoll = 0;
   _pollStats.lastArticleDecisions = [];
 
@@ -1400,7 +1350,6 @@ async function pollAndNotify() {
         const messages = [];
         let noInterest = 0;
         let nightBlocks = 0;
-        let rateBlocks = 0;
         for (const [token, d] of _tokens) {
           const topics = d.topics || [];
           const wantsIt = topics.includes(topic) ||
@@ -1415,11 +1364,6 @@ async function pollAndNotify() {
             if (isNightQuietHoursBucharest()) {
               skippedNight++;
               nightBlocks++;
-              continue;
-            }
-            if (!shouldEnqueueAndPersist(token, d)) {
-              skippedRate++;
-              rateBlocks++;
               continue;
             }
           }
@@ -1452,16 +1396,14 @@ async function pollAndNotify() {
         };
         if (messages.length === 0) {
           decision.outcome = 'no_push_queued';
-          decision.breakdown = { noInterest, nightBlocks, rateBlocks };
+          decision.breakdown = { noInterest, nightBlocks };
           if (noInterest === _tokens.size) {
             decision.reasonHint =
               'Niciun token nu are bifat acest topic. Breaking merge doar dacă ai breaking sau live_alerts.';
-          } else if (nightBlocks > 0 && rateBlocks === 0) {
+          } else if (nightBlocks > 0) {
             decision.reasonHint = 'Fereastră noapte RO (00:00–07:59): push non-urgent suprimat pentru toți cei abonați.';
-          } else if (rateBlocks > 0 && nightBlocks === 0) {
-            decision.reasonHint = 'Cap orar (4 non-urgent/oră/device) atins pentru toți cei eligibili.';
           } else {
-            decision.reasonHint = 'Combinație: unii fără topic, alții noapte sau cap orar — vezi breakdown.';
+            decision.reasonHint = 'Combinație topic/noapte — vezi breakdown.';
           }
         } else {
           decision.outcome = 'sent_to_expo';
@@ -1476,8 +1418,8 @@ async function pollAndNotify() {
     }
   }
 
-  if (skippedNight || skippedRate) {
-    console.log(`[push] suppressed night=${skippedNight} hourly_cap=${skippedRate} (${TZ_BUCHAREST})`);
+  if (skippedNight) {
+    console.log(`[push] suppressed night=${skippedNight} (${TZ_BUCHAREST})`);
   }
 
   _pollStats.lastPollAt = new Date().toISOString();
@@ -1485,7 +1427,6 @@ async function pollAndNotify() {
   _pollStats.totalPolls += 1;
   _pollStats.totalPushesSent += pushesThisPoll;
   _pollStats.totalSkippedNight += skippedNight;
-  _pollStats.totalSkippedRate += skippedRate;
 }
 
 // Start poller: seed after 20 s, then every 3 min
@@ -2046,7 +1987,8 @@ const server = http.createServer(async (req, res) => {
       nowUtc: new Date().toISOString(),
       nowBucharest: getBucharestClockParts(new Date()).hourKey,
       nightQuietHours: isNightQuietHoursBucharest(),
-      pushMaxNonUrgentPerHour: PUSH_MAX_NON_URGENT_PER_HOUR,
+      pushMaxNonUrgentPerHour: null,
+      hourlyRateCapRemoved: true,
       tokensCount: _tokens.size,
       tokens: tokenSummary,
       pollStats: _pollStats,
