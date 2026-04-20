@@ -996,24 +996,50 @@ async function loadTokensFromDb() {
 const _seenUrls = new Map(); // Map<feedUrl, Set<articleUrl>>
 
 // RSS feeds → topic mapping (matches NotificationTopic in app types)
+/**
+ * Surse RSS pentru polling.
+ *
+ * IP-ul Railway e rate-limit-at agresiv de Cloudflare pe sub-feed-urile
+ * individuale (/politica/feed, /economic/feed, …) — returnează HTTP 429 în
+ * masă. DOAR feed-ul principal /feed răspunde consistent cu 200 OK.
+ *
+ * Soluția: folosim un singur feed (main) și clasificăm fiecare articol pe
+ * baza URL-ului (ex. b1tv.ro/politica/… → topic=politica). Astfel, toți
+ * abonații la oricare topic primesc notificări fără să mai încercăm
+ * sub-feeds-urile blocate.
+ *
+ * Sub-feeds-urile pot fi re-activate rapid dacă Cloudflare relaxează
+ * rate-limit-ul (vezi `_rssBackoff` și /admin/push-stats).
+ */
 const RSS_FEEDS = [
-  { url: 'https://www.b1tv.ro/feed',                   topic: 'breaking'  },
-  { url: 'https://www.b1tv.ro/politica/feed',          topic: 'politica'  },
-  { url: 'https://www.b1tv.ro/economic/feed',          topic: 'economie'  },
-  { url: 'https://www.b1tv.ro/externe/feed',           topic: 'extern'    },
-  { url: 'https://www.b1tv.ro/sport/feed',             topic: 'sport'     },
-  { url: 'https://www.b1tv.ro/eveniment/feed',         topic: 'eveniment' },
-  { url: 'https://www.b1tv.ro/meteo/feed',             topic: 'meteo'     },
-  { url: 'https://www.b1tv.ro/monden/feed',            topic: 'lifestyle' },
-  // NOTE: b1tv.ro nu expune un feed RSS separat pentru IT&C (toate URL-urile
-  // candidate — /it-c, /tehnologie, /it, /it-si-comunicatii — dau 404).
-  // Topic-ul 'itc' rămâne în UI (useUserStore); dacă utilizatorul îl bifează,
-  // nu primește notificări (nici un articol etichetat exclusiv 'itc'). Se va
-  // re-adăuga dacă B1TV publică feed-ul în viitor.
-  { url: 'https://www.b1tv.ro/auto/feed',              topic: 'auto'      },
-  { url: 'https://www.b1tv.ro/horoscop/feed',          topic: 'horoscop'  },
-  { url: 'https://www.b1tv.ro/calendar-religios/feed', topic: 'calendar'  },
+  { url: 'https://www.b1tv.ro/feed', topic: 'main' },
 ];
+
+/** URL path → topic map. Topic "main" = clasifică pe URL. */
+const URL_TOPIC_MAP = [
+  { re: /\/politica\//i,          topic: 'politica'  },
+  { re: /\/externe\//i,           topic: 'extern'    },
+  { re: /\/economic\//i,          topic: 'economie'  },
+  { re: /\/sport\//i,             topic: 'sport'     },
+  { re: /\/eveniment\//i,         topic: 'eveniment' },
+  { re: /\/meteo\//i,             topic: 'meteo'     },
+  { re: /\/monden\//i,            topic: 'lifestyle' },
+  { re: /\/auto\//i,              topic: 'auto'      },
+  { re: /\/horoscop\//i,          topic: 'horoscop'  },
+  { re: /\/calendar-religios\//i, topic: 'calendar'  },
+];
+
+/**
+ * Derivă topic-ul din URL-ul articolului. Returnează null dacă nu match
+ * (articol de homepage sau fără subcategorie recunoscută).
+ */
+function inferTopicFromUrl(url) {
+  if (!url) return null;
+  for (const { re, topic } of URL_TOPIC_MAP) {
+    if (re.test(url)) return topic;
+  }
+  return null;
+}
 
 const TOPIC_LABELS = {
   breaking: 'Breaking News', politica: 'Politică', economie: 'Economie',
@@ -1336,19 +1362,24 @@ async function pollAndNotify() {
       }
       console.log(`[push] ${fresh.length} new article(s) in ${feed.topic}`);
 
-      for (const article of fresh.slice(0, 3)) {
-        // For the main /feed (mapped to 'breaking'), only notify if the title
-        // actually contains breaking-news keywords — otherwise it would fire
-        // for every monden/lifestyle/sport article published on the main feed.
-        const isMainFeed = feed.url.endsWith('/feed') && !feed.url.includes('/monden') &&
-          !feed.url.includes('/sport') && !feed.url.includes('/politic') &&
-          feed.url === 'https://www.b1tv.ro/feed';
-        if (isMainFeed && !BREAKING_RE.test(article.title) &&
-          !isEarthquakeStory(article.title, article.body)) continue;
-
-        const isBreaking = feed.topic === 'breaking' || BREAKING_RE.test(article.title);
+      for (const article of fresh.slice(0, 5)) {
         const isEarthquake = isEarthquakeStory(article.title, article.body);
-        const topic = isBreaking ? 'breaking' : feed.topic;
+        const isBreaking = BREAKING_RE.test(article.title) || isEarthquake;
+
+        // Derive topic:
+        // - feed cu topic fix (sub-feed) → topic-ul feed-ului
+        // - feed "main" → inferă din URL-ul articolului
+        // - breaking pozitiv → topic=breaking (suprascrie inferența, cu prioritate urgentă)
+        let topic;
+        if (isBreaking) {
+          topic = 'breaking';
+        } else if (feed.topic === 'main') {
+          topic = inferTopicFromUrl(article.link);
+          // Articol fără categorie mapabilă → nu avem la cine să-l trimitem
+          if (!topic) continue;
+        } else {
+          topic = feed.topic;
+        }
 
         const messages = [];
         for (const [token, d] of _tokens) {
