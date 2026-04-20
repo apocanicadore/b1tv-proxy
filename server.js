@@ -1111,22 +1111,61 @@ function parseRssFeed(xml) {
   return items;
 }
 
-function fetchRssFeed(feedUrl) {
-  return new Promise((resolve) => {
-    const req = https.get(feedUrl, {
-      headers: { 'User-Agent': MOBILE_UA, 'Accept': 'application/rss+xml, text/xml, */*' },
-      timeout: 10_000,
-    }, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        try { resolve(parseRssFeed(Buffer.concat(chunks).toString('utf8'))); }
-        catch (e) { console.warn('[push] RSS parse error:', e.message); resolve([]); }
-      });
+/**
+ * Ultimul status de fetch per URL (pentru /admin/push-stats).
+ * Map<feedUrl, { status, bytes, items, error }>
+ */
+const _rssFetchDiagnostics = new Map();
+
+/**
+ * Fetch + parse RSS.
+ *
+ * Folosește `fetch()` global (Node 18+) în loc de `https.get` brut pentru că:
+ *  - urmărește automat redirect-urile 301/302 (unele instalări WordPress le fac),
+ *  - decomprimă automat răspunsurile gzip/br (unele CDN-uri Cloudflare le servesc
+ *    comprimate chiar și fără Accept-Encoding explicit),
+ *  - are error-handling mai standardizat și timeout via AbortController.
+ *
+ * Înainte, feed-urile sub-categorii (politica, externe, sport, etc.) întorceau
+ * sistematic 0 articole de pe IP-ul Railway, în timp ce mergeau de pe workstation.
+ * Cauza cea mai probabilă: un răspuns gzip nedecomprimat sau un redirect silențios.
+ */
+async function fetchRssFeed(feedUrl) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15_000);
+  try {
+    const res = await fetch(feedUrl, {
+      signal:      ctrl.signal,
+      redirect:    'follow',
+      headers: {
+        'User-Agent':      MOBILE_UA,
+        Accept:            'application/rss+xml, text/xml;q=0.9, */*;q=0.5',
+        'Accept-Language': 'ro-RO,ro;q=0.9,en;q=0.6',
+      },
     });
-    req.on('error', (e) => { console.warn('[push] RSS fetch error:', e.message); resolve([]); });
-    req.on('timeout', () => { req.destroy(); resolve([]); });
-  });
+    clearTimeout(timer);
+    const xml = await res.text();
+    const bytes = xml.length;
+    if (!res.ok) {
+      _rssFetchDiagnostics.set(feedUrl, { status: res.status, bytes, items: 0, error: `HTTP ${res.status}` });
+      console.warn(`[push] RSS HTTP ${res.status} for ${feedUrl}`);
+      return [];
+    }
+    const items = parseRssFeed(xml);
+    _rssFetchDiagnostics.set(feedUrl, {
+      status: res.status,
+      bytes,
+      items: items.length,
+      error: items.length === 0 ? 'parsed-0-items' : null,
+    });
+    return items;
+  } catch (e) {
+    clearTimeout(timer);
+    const msg = (e && e.message) || String(e);
+    _rssFetchDiagnostics.set(feedUrl, { status: 0, bytes: 0, items: 0, error: msg.slice(0, 120) });
+    console.warn('[push] RSS fetch error:', feedUrl, '—', msg.slice(0, 120));
+    return [];
+  }
 }
 
 // ── Expo Push API sender ──────────────────────────────────────────────────────
@@ -1861,6 +1900,10 @@ const server = http.createServer(async (req, res) => {
         pushHourKey: d.pushHourKey || null,
       });
     }
+    const rssDiag = {};
+    for (const [url, diag] of _rssFetchDiagnostics) {
+      rssDiag[url] = diag;
+    }
     res.writeHead(200);
     res.end(JSON.stringify({
       nowUtc: new Date().toISOString(),
@@ -1870,6 +1913,7 @@ const server = http.createServer(async (req, res) => {
       tokensCount: _tokens.size,
       tokens: tokenSummary,
       pollStats: _pollStats,
+      rssFetchDiagnostics: rssDiag,
     }, null, 2));
     return;
   }
