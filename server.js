@@ -1005,7 +1005,11 @@ const RSS_FEEDS = [
   { url: 'https://www.b1tv.ro/eveniment/feed',         topic: 'eveniment' },
   { url: 'https://www.b1tv.ro/meteo/feed',             topic: 'meteo'     },
   { url: 'https://www.b1tv.ro/monden/feed',            topic: 'lifestyle' },
-  { url: 'https://www.b1tv.ro/it-c/feed',              topic: 'itc'       },
+  // NOTE: b1tv.ro nu expune un feed RSS separat pentru IT&C (toate URL-urile
+  // candidate — /it-c, /tehnologie, /it, /it-si-comunicatii — dau 404).
+  // Topic-ul 'itc' rămâne în UI (useUserStore); dacă utilizatorul îl bifează,
+  // nu primește notificări (nici un articol etichetat exclusiv 'itc'). Se va
+  // re-adăuga dacă B1TV publică feed-ul în viitor.
   { url: 'https://www.b1tv.ro/auto/feed',              topic: 'auto'      },
   { url: 'https://www.b1tv.ro/horoscop/feed',          topic: 'horoscop'  },
   { url: 'https://www.b1tv.ro/calendar-religios/feed', topic: 'calendar'  },
