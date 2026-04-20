@@ -1036,8 +1036,26 @@ function sendExpoPush(messages) {
 
 // ── RSS poller ────────────────────────────────────────────────────────────────
 
+/**
+ * Diagnostic state — populat la fiecare pollAndNotify(). Expus prin GET /admin/push-stats.
+ * In-memory; se pierde la restart (Railway redeploy).
+ */
+const _pollStats = {
+  lastPollAt: null,
+  lastPollDurationMs: null,
+  lastError: null,
+  totalPolls: 0,
+  totalPushesSent: 0,
+  totalSkippedNight: 0,
+  totalSkippedRate: 0,
+  /** { [topic]: { lastFetchAt, articleCount, seenSize, freshCount, lastError, pushesSent } } */
+  perFeed: {},
+};
+
 async function pollAndNotify() {
   if (_tokens.size === 0) return;
+
+  const pollStart = Date.now();
 
   // Remove tokens older than 24 h (likely uninstalled devices)
   const cutoff = Date.now() - 24 * 60 * 60 * 1000;
@@ -1049,15 +1067,28 @@ async function pollAndNotify() {
 
   let skippedNight = 0;
   let skippedRate = 0;
+  let pushesThisPoll = 0;
 
   for (const feed of RSS_FEEDS) {
+    const feedStat = _pollStats.perFeed[feed.topic] ?? {};
+    feedStat.lastFetchAt = new Date().toISOString();
     try {
       const articles = await fetchRssFeed(feed.url);
-      if (!articles.length) continue;
+      feedStat.articleCount = articles.length;
+      feedStat.lastError = null;
+      if (!articles.length) {
+        feedStat.lastError = 'empty-or-fetch-failed';
+        _pollStats.perFeed[feed.topic] = feedStat;
+        continue;
+      }
 
       if (!_seenUrls.has(feed.url)) {
         // First poll: seed seen set without sending notifications
         _seenUrls.set(feed.url, new Set(articles.map((a) => a.link)));
+        feedStat.seenSize = articles.length;
+        feedStat.freshCount = 0;
+        feedStat.seeded = true;
+        _pollStats.perFeed[feed.topic] = feedStat;
         continue;
       }
 
@@ -1073,8 +1104,13 @@ async function pollAndNotify() {
           seen.delete(oldest);
         }
       });
+      feedStat.seenSize = seen.size;
+      feedStat.freshCount = fresh.length;
 
-      if (!fresh.length) continue;
+      if (!fresh.length) {
+        _pollStats.perFeed[feed.topic] = feedStat;
+        continue;
+      }
       console.log(`[push] ${fresh.length} new article(s) in ${feed.topic}`);
 
       for (const article of fresh.slice(0, 3)) {
@@ -1125,15 +1161,27 @@ async function pollAndNotify() {
         for (let i = 0; i < messages.length; i += 100) {
           await sendExpoPush(messages.slice(i, i + 100));
         }
+        pushesThisPoll += messages.length;
+        feedStat.pushesSent = (feedStat.pushesSent || 0) + messages.length;
       }
+      _pollStats.perFeed[feed.topic] = feedStat;
     } catch (e) {
       console.warn(`[push] feed error (${feed.topic}):`, e.message);
+      feedStat.lastError = e.message || String(e);
+      _pollStats.perFeed[feed.topic] = feedStat;
     }
   }
 
   if (skippedNight || skippedRate) {
     console.log(`[push] suppressed night=${skippedNight} hourly_cap=${skippedRate} (${TZ_BUCHAREST})`);
   }
+
+  _pollStats.lastPollAt = new Date().toISOString();
+  _pollStats.lastPollDurationMs = Date.now() - pollStart;
+  _pollStats.totalPolls += 1;
+  _pollStats.totalPushesSent += pushesThisPoll;
+  _pollStats.totalSkippedNight += skippedNight;
+  _pollStats.totalSkippedRate += skippedRate;
 }
 
 // Start poller: seed after 20 s, then every 3 min
@@ -1656,6 +1704,35 @@ const server = http.createServer(async (req, res) => {
     );
     res.writeHead(200);
     res.end(JSON.stringify({ ok: true, topics: validTopics }));
+    return;
+  }
+
+  // ── GET /admin/push-stats ─────────────────────────────────────────────────
+  // Diagnostic — poll RSS stats, token summary. Fără auth (proxy e deja public).
+  if (req.method === 'GET' && url === '/admin/push-stats') {
+    res.setHeader('Content-Type', 'application/json');
+    const tokenSummary = [];
+    for (const [token, d] of _tokens) {
+      tokenSummary.push({
+        tokenSuffix: `…${token.slice(-10)}`,
+        topics: d.topics || [],
+        topicsCount: (d.topics || []).length,
+        registeredAt: new Date(d.registeredAt).toISOString(),
+        ageHours: Math.round((Date.now() - d.registeredAt) / 36e5 * 10) / 10,
+        nonUrgentInHour: d.nonUrgentPushCount || 0,
+        pushHourKey: d.pushHourKey || null,
+      });
+    }
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      nowUtc: new Date().toISOString(),
+      nowBucharest: getBucharestClockParts(new Date()).hourKey,
+      nightQuietHours: isNightQuietHoursBucharest(),
+      pushMaxNonUrgentPerHour: PUSH_MAX_NON_URGENT_PER_HOUR,
+      tokensCount: _tokens.size,
+      tokens: tokenSummary,
+      pollStats: _pollStats,
+    }, null, 2));
     return;
   }
 
