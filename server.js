@@ -1471,6 +1471,27 @@ function fetchFeedXml(url) {
   });
 }
 
+/** Same logic as app formatting.ts — numeric quotes &#8222; etc. + &amp; chains */
+function decodeHtmlEntities(text) {
+  if (!text || typeof text !== 'string') return '';
+  let s = text;
+  for (let i = 0; i < 8; i++) {
+    const next = s.replace(/&amp;/g, '&');
+    if (next === s) break;
+    s = next;
+  }
+  return s
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&hellip;/g, '…')
+    .trim();
+}
+
 function parseRssItems(xml) {
   const items = [];
   const re = /<item[\s>]([\s\S]*?)<\/item>/gi;
@@ -1478,7 +1499,7 @@ function parseRssItems(xml) {
   while ((m = re.exec(xml)) !== null) {
     const block = m[1];
     const titleMatch = block.match(/<title[^>]*>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/i);
-    const title = (titleMatch?.[1] ?? '').trim().replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+    const title = decodeHtmlEntities((titleMatch?.[1] ?? '').trim());
     const pubDateMatch = block.match(/<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i);
     const pubDate = pubDateMatch?.[1]?.trim() ?? '';
     const linkMatch = block.match(/<link[^>]*>([\s\S]*?)<\/link>/i);
@@ -1563,11 +1584,11 @@ ${headlines}`;
   const topics = (parsed.topics ?? []).slice(0, 6).map((t) => {
     const src = sourcesSlice[t.article_index - 1];
     return {
-      title: t.title ?? '',
-      body: t.body ?? '',
+      title: decodeHtmlEntities(String(t.title ?? '')),
+      body: decodeHtmlEntities(String(t.body ?? '')),
       article: src ? {
         index: t.article_index,
-        title: src.title,
+        title: decodeHtmlEntities(String(src.title ?? '')),
         link: src.link,
         category: src.category,
         publishedAt: src.pubDate.toISOString(),
