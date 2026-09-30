@@ -2211,6 +2211,165 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ─── CONFIG ────────────────────────────────────────────
+  // GET /config — aplicația fetch-uiește la start
+  if (req.method === 'GET' && url === '/config') {
+    res.setHeader('Content-Type', 'application/json');
+    try {
+      const result = await dbQuery('SELECT key, value FROM app_config');
+      if (!result) {
+        res.writeHead(503);
+        res.end(JSON.stringify({ error: 'database unavailable' }));
+        return;
+      }
+      const config = {};
+      result.rows.forEach(r => config[r.key] = r.value);
+      res.writeHead(200);
+      res.end(JSON.stringify(config));
+    } catch (err) {
+      console.error('[CONFIG]', err);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: 'internal error' }));
+    }
+    return;
+  }
+
+  // ─── SCHEDULE ──────────────────────────────────────────
+  // GET /schedule — grila TV dinamică
+  if (req.method === 'GET' && url === '/schedule') {
+    res.setHeader('Content-Type', 'application/json');
+    try {
+      const result = await dbQuery(
+        'SELECT * FROM tv_schedule ORDER BY day_of_week, start_time'
+      );
+      if (!result) {
+        res.writeHead(503);
+        res.end(JSON.stringify({ error: 'database unavailable' }));
+        return;
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify(result.rows));
+    } catch (err) {
+      console.error('[SCHEDULE]', err);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: 'internal error' }));
+    }
+    return;
+  }
+
+  // ─── EVENTS ────────────────────────────────────────────
+  // POST /events — aplicația trimite evenimente în batch
+  if (req.method === 'POST' && url === '/events') {
+    res.setHeader('Content-Type', 'application/json');
+    const events = await readBody(req);
+    if (!Array.isArray(events) || events.length === 0) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'events must be a non-empty array' }));
+      return;
+    }
+    // Limitează la 50 de evenimente per request
+    const batch = events.slice(0, 50);
+    try {
+      const values = batch.map((e, i) => {
+        const base = i * 4;
+        return `($${base+1}, $${base+2}, $${base+3}, $${base+4})`;
+      }).join(', ');
+      const params = batch.flatMap(e => [
+        e.device_id || 'unknown',
+        e.event_type || 'unknown',
+        JSON.stringify(e.payload || {}),
+        e.created_at || new Date().toISOString()
+      ]);
+      const inserted = await dbQuery(
+        `INSERT INTO app_events (device_id, event_type, payload, created_at)
+         VALUES ${values}`,
+        params
+      );
+      if (!inserted) {
+        res.writeHead(503);
+        res.end(JSON.stringify({ error: 'database unavailable' }));
+        return;
+      }
+      // Upsert device profile
+      if (batch[0]?.device_id && batch[0]?.device_id !== 'unknown') {
+        const profile = batch.find(e => e.event_type === 'app_open')?.payload || {};
+        await dbQuery(`
+          INSERT INTO device_profiles
+            (device_id, platform, app_version, last_seen_at, sessions_count)
+          VALUES ($1, $2, $3, NOW(), 1)
+          ON CONFLICT (device_id) DO UPDATE SET
+            last_seen_at = NOW(),
+            sessions_count = device_profiles.sessions_count + 1,
+            platform = COALESCE($2, device_profiles.platform),
+            app_version = COALESCE($3, device_profiles.app_version)
+        `, [
+          batch[0].device_id,
+          profile.platform || null,
+          profile.app_version || null
+        ]);
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({ received: batch.length }));
+    } catch (err) {
+      console.error('[EVENTS]', err);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: 'internal error' }));
+    }
+    return;
+  }
+
+  // ─── ADMIN METRICS ─────────────────────────────────────
+  // GET /admin/metrics — dashboard admin panel
+  // Protejat cu API key din environment variable ADMIN_KEY
+  if (req.method === 'GET' && url === '/admin/metrics') {
+    res.setHeader('Content-Type', 'application/json');
+    const key = req.headers['x-admin-key'];
+    if (key !== process.env.ADMIN_KEY) {
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return;
+    }
+    try {
+      const [active7d, activeToday, liveToday, eventsToday, topTopics] =
+        await Promise.all([
+          dbQuery(`SELECT COUNT(DISTINCT device_id) as count
+                      FROM device_profiles
+                      WHERE last_seen_at > NOW() - INTERVAL '7 days'`),
+          dbQuery(`SELECT COUNT(DISTINCT device_id) as count
+                      FROM app_events
+                      WHERE created_at > NOW() - INTERVAL '24 hours'`),
+          dbQuery(`SELECT COUNT(*) as count
+                      FROM app_events
+                      WHERE event_type = 'live_start'
+                      AND created_at > NOW() - INTERVAL '24 hours'`),
+          dbQuery(`SELECT event_type, COUNT(*) as count
+                      FROM app_events
+                      WHERE created_at > NOW() - INTERVAL '24 hours'
+                      GROUP BY event_type ORDER BY count DESC`),
+          dbQuery(`SELECT unnest(notif_topics) as topic, COUNT(*) as count
+                      FROM device_profiles GROUP BY topic ORDER BY count DESC`),
+        ]);
+      if (!active7d || !activeToday || !liveToday || !eventsToday || !topTopics) {
+        res.writeHead(503);
+        res.end(JSON.stringify({ error: 'database unavailable' }));
+        return;
+      }
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        users_active_7d: parseInt(active7d.rows[0].count),
+        users_active_today: parseInt(activeToday.rows[0].count),
+        live_starts_today: parseInt(liveToday.rows[0].count),
+        events_today: eventsToday.rows,
+        top_topics: topTopics.rows,
+      }));
+    } catch (err) {
+      console.error('[METRICS]', err);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: 'internal error' }));
+    }
+    return;
+  }
+
   // ── 404 catch-all (must be before the /live-url handler) ─────────────────
   if (req.method !== 'GET' || url !== '/live-url') {
     res.setHeader('Content-Type', 'application/json');
