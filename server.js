@@ -33,6 +33,7 @@ const StealthPlugin  = require('puppeteer-extra-plugin-stealth');
 puppeteerExtra.use(StealthPlugin());
 const puppeteer = puppeteerExtra;
 const { Pool }  = require('pg');
+const cron      = require('node-cron');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const PORT        = process.env.PORT || 3031;
@@ -2284,6 +2285,63 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('╚══════════════════════════════════════════════════════════╝');
   console.log('');
 });
+
+// Briefing dimineață — 7:30 ora României (UTC+3 vara, UTC+2 iarna)
+// UTC: 04:30 vara / 05:30 iarna — folosim 05:30 UTC ca medie sigură
+cron.schedule('30 5 * * *', async () => {
+  console.log('[BRIEFING] Trimit briefing de dimineață...');
+  await sendBriefingNotification('dimineata');
+}, { timezone: 'UTC' });
+
+// Briefing seară — 18:30 ora României
+// UTC: 15:30 vara / 16:30 iarna
+cron.schedule('30 15 * * *', async () => {
+  console.log('[BRIEFING] Trimit briefing de seară...');
+  await sendBriefingNotification('seara');
+}, { timezone: 'UTC' });
+
+async function sendBriefingNotification(period) {
+  try {
+    // topics e JSONB (array de stringuri), nu TEXT[]. Nu există coloana active;
+    // tokenii mai vechi de 24h sunt considerați expirați, ca la loadTokensFromDb.
+    const result = await dbQuery(
+      `SELECT token FROM push_tokens
+        WHERE topics @> $1::jsonb
+          AND registered_at > NOW() - INTERVAL '24 hours'`,
+      [JSON.stringify(['briefing'])],
+    );
+    if (!result || result.rows.length === 0) return;
+
+    const title = period === 'dimineata'
+      ? '☀️ Briefingul de dimineață B1TV'
+      : '🌆 Briefingul de seară B1TV';
+    const body = 'Cele mai importante 5 știri ale zilei. Apasă pentru a citi.';
+
+    const messages = result.rows.map((row) => ({
+      to: row.token,
+      channelId: 'daily_briefing',
+      title,
+      body,
+      data: {
+        topic: 'briefing',
+        deepLink: 'b1tv://news',
+        channelId: 'daily_briefing',
+      },
+    }));
+
+    for (let i = 0; i < messages.length; i += 100) {
+      const batch = messages.slice(i, i + 100);
+      await fetch('https://exp.host/--/api/v2/push/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(batch),
+      });
+    }
+    console.log(`[BRIEFING] ${messages.length} tokeni notificati (${period})`);
+  } catch (err) {
+    console.error('[BRIEFING] Eroare:', err);
+  }
+}
 
 // ── Proactive warmup ──────────────────────────────────────────────────────────
 // Re-resolve the HLS URL every WARMUP_INTERVAL_MS so the cache is always fresh.
