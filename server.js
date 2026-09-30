@@ -486,6 +486,34 @@ async function dbQuery(sql, params = []) {
   finally { client.release(); }
 }
 
+let config = {};
+let lastLiveAlert = 0;
+const _briefingSent = new Set();
+
+async function refreshAppConfig() {
+  try {
+    const result = await dbQuery('SELECT key, value FROM app_config');
+    if (!result) {
+      console.warn('[config] database unavailable');
+      return;
+    }
+    const next = {};
+    for (const row of result.rows) next[row.key] = row.value;
+    config = next;
+    console.log(`[config] loaded ${Object.keys(config).length} keys`);
+  } catch (err) {
+    console.error('[config] refresh failed:', err.message);
+  }
+}
+
+function configClock(value, fallback) {
+  const match = String(value || '').trim().match(/^(\d{1,2}):(\d{2})/);
+  if (!match) return fallback;
+  const hour = Math.min(23, Math.max(0, Number(match[1])));
+  const minute = Math.min(59, Math.max(0, Number(match[2])));
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
 async function initSchema() {
   if (!_pool) { console.log('[db] No DATABASE_URL — email/password auth unavailable'); return; }
   await dbQuery(`
@@ -1048,13 +1076,19 @@ function getBucharestClockParts(date) {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
-    hour12: false,
+    minute: '2-digit',
+    hourCycle: 'h23',
   }).formatToParts(date);
   const get = (t) => parts.find((p) => p.type === t)?.value ?? '';
-  const h = get('hour');
+  let hour = get('hour');
+  if (hour === '24') hour = '00';
+  hour = hour.padStart(2, '0');
+  const minute = (get('minute') || '00').padStart(2, '0');
   return {
-    hourKey: `${get('year')}-${get('month')}-${get('day')}-${h}`,
-    hour: parseInt(h, 10),
+    hourKey: `${get('year')}-${get('month')}-${get('day')}-${hour}`,
+    hour: parseInt(hour, 10),
+    hhmm: `${hour}:${minute}`,
+    dateKey: `${get('year')}-${get('month')}-${get('day')}`,
   };
 }
 
@@ -2212,7 +2246,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ─── CONFIG ────────────────────────────────────────────
-  // GET /config — aplicația fetch-uiește la start
+  // GET /config — aplicația fetch-uiește la start. Mereu din DB, nu din cache.
   if (req.method === 'GET' && url === '/config') {
     res.setHeader('Content-Type', 'application/json');
     try {
@@ -2222,8 +2256,9 @@ const server = http.createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'database unavailable' }));
         return;
       }
-      const config = {};
-      result.rows.forEach(r => config[r.key] = r.value);
+      const fresh = {};
+      result.rows.forEach(r => { fresh[r.key] = r.value; });
+      config = fresh;
       res.writeHead(200);
       res.end(JSON.stringify(config));
     } catch (err) {
@@ -2231,6 +2266,74 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(500);
       res.end(JSON.stringify({ error: 'internal error' }));
     }
+    return;
+  }
+
+  // ── POST /notify — push manual din admin ────────────────────────────────
+  if (req.method === 'POST' && url === '/notify') {
+    res.setHeader('Content-Type', 'application/json');
+    const auth = req.headers['authorization'] || '';
+    const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const key = req.headers['x-admin-key'] || bearer;
+    if (!process.env.ADMIN_KEY || key !== process.env.ADMIN_KEY) {
+      res.writeHead(401);
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return;
+    }
+
+    const body = await readBody(req);
+    const title = String(body.title || '').trim();
+    const message = String(body.body || '').trim();
+    const channelId = String(body.channelId || '').trim();
+    const topic = String(body.topic || '').trim();
+    if (!title || !message || !channelId) {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'title, body and channelId are required' }));
+      return;
+    }
+
+    if (channelId === 'breaking_news' && config.breaking_news_enabled === 'false') {
+      res.writeHead(403);
+      res.end(JSON.stringify({ error: 'Breaking news notifications disabled' }));
+      return;
+    }
+
+    if (channelId === 'live_alerts') {
+      const cooldown = Number(config.live_alert_cooldown_minutes);
+      if (Number.isFinite(cooldown) && cooldown > 0 && lastLiveAlert) {
+        const elapsed = (Date.now() - lastLiveAlert) / 60000;
+        if (elapsed < cooldown) {
+          res.writeHead(429);
+          res.end(JSON.stringify({
+            error: 'Cooldown active',
+            retry_after_minutes: Math.ceil(cooldown - elapsed),
+          }));
+          return;
+        }
+      }
+    }
+
+    const messages = [];
+    for (const [token, data] of _tokens) {
+      const topics = data.topics || [];
+      if (topic && topic !== 'all' && !topics.includes(topic)) continue;
+      messages.push({
+        to: token,
+        title,
+        body: message,
+        sound: 'default',
+        priority: channelId === 'breaking_news' ? 'high' : 'normal',
+        channelId,
+        data: { topic: topic || channelId, channelId },
+      });
+    }
+    for (let i = 0; i < messages.length; i += 100) {
+      await sendExpoPush(messages.slice(i, i + 100));
+    }
+    if (channelId === 'live_alerts') lastLiveAlert = Date.now();
+    console.log(`[notify] ${channelId} topic=${topic || '-'} sent=${messages.length}`);
+    res.writeHead(200);
+    res.end(JSON.stringify({ ok: true, recipients_count: messages.length }));
     return;
   }
 
@@ -2439,25 +2542,41 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log('║  GET  /hls-segment      →  segment proxy from CDN       ║');
   console.log('║  GET  /live-url         →  raw CDN URL (diagnostics)    ║');
   console.log('║  POST /register-token   →  push notification token      ║');
+  console.log('║  POST /notify           →  admin push                   ║');
+  console.log('║  GET  /config           →  app config                   ║');
   console.log('║  GET  /polls            →  poll data                    ║');
   console.log('║  POST /polls/:id/vote   →  submit vote                  ║');
   console.log('╚══════════════════════════════════════════════════════════╝');
   console.log('');
 });
 
-// Briefing dimineață — 7:30 ora României (UTC+3 vara, UTC+2 iarna)
-// UTC: 04:30 vara / 05:30 iarna — folosim 05:30 UTC ca medie sigură
-cron.schedule('30 5 * * *', async () => {
-  console.log('[BRIEFING] Trimit briefing de dimineață...');
-  await sendBriefingNotification('dimineata');
-}, { timezone: 'UTC' });
+refreshAppConfig();
+setInterval(refreshAppConfig, 5 * 60 * 1000);
 
-// Briefing seară — 18:30 ora României
-// UTC: 15:30 vara / 16:30 iarna
-cron.schedule('30 15 * * *', async () => {
-  console.log('[BRIEFING] Trimit briefing de seară...');
-  await sendBriefingNotification('seara');
-}, { timezone: 'UTC' });
+// În fiecare minut: dacă ora României coincide cu ora din app_config, trimite briefingul.
+cron.schedule('* * * * *', async () => {
+  if (config.daily_briefing_enabled !== 'true') return;
+  const clock = getBucharestClockParts(new Date());
+  const morning = configClock(config.briefing_morning_time, '07:30');
+  const evening = configClock(config.briefing_evening_time, '18:30');
+
+  if (clock.hhmm === morning) {
+    const slot = `${clock.dateKey}-morning`;
+    if (!_briefingSent.has(slot)) {
+      _briefingSent.add(slot);
+      console.log(`[BRIEFING] Trimit briefing de dimineață (${morning})...`);
+      await sendBriefingNotification('dimineata');
+    }
+  }
+  if (clock.hhmm === evening) {
+    const slot = `${clock.dateKey}-evening`;
+    if (!_briefingSent.has(slot)) {
+      _briefingSent.add(slot);
+      console.log(`[BRIEFING] Trimit briefing de seară (${evening})...`);
+      await sendBriefingNotification('seara');
+    }
+  }
+}, { timezone: 'Europe/Bucharest' });
 
 async function sendBriefingNotification(period) {
   try {
