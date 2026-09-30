@@ -1375,7 +1375,7 @@ async function pollAndNotify() {
             data:      { deepLink: article.link, topic, articleUrl: article.link },
             sound:     isBreaking ? 'default' : 'default',
             priority:  isBreaking ? 'high' : 'normal',
-            channelId: isBreaking ? 'breaking' : 'news',
+            channelId: isBreaking ? 'breaking_news' : 'live_alerts',
           });
         }
 
